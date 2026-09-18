@@ -2,9 +2,7 @@
 set -euo pipefail
 
 # ============================================================
-# GLM-5.3-Flash 3.5bpw (satgeze). MTP-3 draft, no conversation
-# split (DCP=1). Measured: 990,572 KV tokens, 3.02x at a
-# 327,680 context. Bench: 4,300 prefill / 170 decode
+# GLM-5.3-Flash 3.5bpw (satgeze). MTP-3 draft, no conversation split (DCP=1)
 # ============================================================
 
 # ============================================================
@@ -40,7 +38,7 @@ MODEL_CONTAINER="${MODEL_ROOT}/${MODEL##*/}"
 # Settings
 # ============================================================
 TP_SIZE=2
-DCP_SIZE=1                    # no split. Measured: 990,572 KV tokens (boot #9)
+DCP_SIZE=1                    # no split. Draft memory stays local
 GPU_UTIL=0.986                 # weights take about 74 GiB per GPU. Rest is KV cache
 CONTEXT_SIZE=327680
 MAX_NUM_SEQS=6
@@ -93,7 +91,7 @@ VLLM_EXTRA=()
 VLLM_ENV+=(
     -e VLLM_ENGINE_READY_TIMEOUT_S=${HEALTH_START_PERIOD}
     -e VLLM_ENGINE_ITERATION_TIMEOUT_S=120
-    -e OMP_NUM_THREADS=1
+    -e OMP_NUM_THREADS=4
     -e HF_HUB_OFFLINE=1
     -e SAFETENSORS_FAST_GPU=1
     -e VLLM_USE_V2_MODEL_RUNNER=1
@@ -121,9 +119,6 @@ VLLM_SPEC=(
 
 VLLM_EXTRA+=(
     --disable-custom-all-reduce
-    --enable-chunked-prefill
-    --enable-prefix-caching
-    --enable-prompt-tokens-details
     --prefill-compute-share 0.4
     --prefill-schedule-interval 1
     --mm-encoder-attn-backend TORCH_SDPA
@@ -151,8 +146,7 @@ VLLM_EXTRA+=(
 
 podman run --replace --detach --restart=always \
     --entrypoint /bin/bash \
-    --health-cmd="python3 -c \"import urllib.request as u
-u.request.urlopen('http://localhost:${VLLM_PORT}/health', timeout=3).read()\"" \
+    --health-cmd="curl -f http://localhost:${VLLM_PORT}/health || exit 1" \
     --health-start-period="${HEALTH_START_PERIOD}s" \
     --health-interval=30s \
     --health-on-failure=kill \
@@ -177,8 +171,6 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --port "${VLLM_PORT}" \
             `# Model identity` \
             --served-model-name "${MODELNAME}" \
-            --trust-remote-code \
-            --load-format safetensors \
             `# Quantization` \
             --quantization exl3 \
             --dtype bfloat16 \
@@ -202,7 +194,6 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --tool-call-parser glm47 \
             --enable-auto-tool-choice \
             --chat-template /opt/glm53f/chat_template.multimodal.jinja \
-            --default-chat-template-kwargs.thinking=true \
             --default-chat-template-kwargs.reasoning_effort="${REASONING_EFFORT}" \
             `# GLM5Next KDA backends` \
             --additional-config '{"glm53_kda_decode_backend":"auto","kda_prefill_backend":"b12x"}' \
@@ -210,6 +201,7 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --enable-request-id-headers \
             --enable-force-include-usage \
             --enable-per-request-metrics \
+            --enable-prompt-tokens-details \
             "${VLLM_BACKEND[@]}" \
             "${VLLM_EXTRA[@]}" \
             "${VLLM_SPEC[@]}" \
