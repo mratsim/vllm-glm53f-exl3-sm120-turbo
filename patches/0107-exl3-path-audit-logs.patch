@@ -1,0 +1,187 @@
+diff --git a/vllm/model_executor/layers/quantization/exl3.py b/vllm/model_executor/layers/quantization/exl3.py
+index a7bee11..07aed40 100644
+--- a/vllm/model_executor/layers/quantization/exl3.py
++++ b/vllm/model_executor/layers/quantization/exl3.py
+@@ -88,6 +88,19 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
++# 0107: load-time path witnesses. Every quantization decision point reports
++# the FIRST hit of its branch through _audit_path(); tags dedupe per process
++# so the boot log stays bounded while every decision stays greppable.
++_PATCHSET_TAG = "[mratsim's sm120-turbo VLLM_PATCHES_REVISION]"
++_PATH_AUDIT_SEEN: set[str] = set()
++
++
++def _audit_path(tag: str, detail: str) -> None:
++    if tag in _PATH_AUDIT_SEEN:
++        return
++    _PATH_AUDIT_SEEN.add(tag)
++    logger.info("%s path-audit %s: %s", _PATCHSET_TAG, tag, detail)
++
+ _SHARED_EXPERT_PROJECTIONS = frozenset(
+     {"gate_proj", "up_proj", "gate_up_proj", "down_proj"}
+ )
+@@ -273,7 +286,7 @@ def _load_online_encoding_with_retry(
+     """Load/encode one online payload, retrying one non-finite encode."""
+ 
+     try:
+-        return load_or_quantize(cache_key, device=device, quantize=quantize)
++        result = load_or_quantize(cache_key, device=device, quantize=quantize)
+     except Exl3OnlineNonFiniteError:
+         # The fallback encoder uses large randomized GPU reductions. A
+         # transient non-finite result must never become a persistent model
+@@ -287,7 +300,14 @@ def _load_online_encoding_with_retry(
+             cache_key.prefix,
+             cache_key.tp_rank,
+         )
+-        return load_or_quantize(cache_key, device=device, quantize=quantize)
++        result = load_or_quantize(cache_key, device=device, quantize=quantize)
++    _audit_path(
++        "online-cache",
++        f"prefix={cache_key.prefix} bits={cache_key.bits} "
++        f"tp={cache_key.tp_rank} "
++        f"hit={getattr(result, 'hit', '?')} path={getattr(result, 'path', '?')}",
++    )
++    return result
+ 
+ 
+ def _load_exl3_online_quantizer() -> Any:
+@@ -1160,6 +1180,14 @@ class Exl3Config(QuantizationConfig):
+                     f"GLM-5.3 routed-only EXL3 metadata is unsupported: {mismatches}"
+                 )
+             instance.glm53_unsliced_routed_experts = True
++        _audit_path(
++            "from-config",
++            f"scope={config.get('scope')!r} bits={config.get('bits')!r} "
++            f"codebook={config.get('codebook')!r} "
++            f"rank_sliced={'set' if instance.rank_sliced_metadata is not None else 'absent'} "
++            f"r7_block={'set' if getattr(instance, 'r7_routed_experts', None) is not None else 'absent'} "
++            f"glm53_unsliced={instance.glm53_unsliced_routed_experts}",
++        )
+         return instance
+ 
+     @classmethod
+@@ -1569,15 +1597,37 @@ class Exl3Config(QuantizationConfig):
+             prefix = "lm_head"
+         if isinstance(layer, LinearBase) or is_lm_head:
+             if self._linear_prefix_is_exl3(prefix):
++                _audit_path(
++                    "linear-exl3",
++                    f"Exl3LinearMethod (EXL3-owned dense) prefix={prefix!r}",
++                )
+                 return Exl3LinearMethod(self)
+             if not is_lm_head and (
+                 method := self._get_bf16_online_linear_method(layer, prefix)
+             ):
++                _audit_path(
++                    "linear-online",
++                    f"{type(method).__name__} prefix={prefix!r}",
++                )
+                 return method
++            _audit_path(
++                "linear-unquantized",
++                f"UnquantizedLinearMethod prefix={prefix!r}",
++            )
+             return UnquantizedLinearMethod()
+         if isinstance(layer, RoutedExperts):
+             if not self._moe_prefix_is_exl3(prefix, layer):
++                _audit_path(
++                    "moe-skipped",
++                    f"non-EXL3 RoutedExperts prefix={prefix!r}",
++                )
+                 return None
++            _audit_path(
++                "moe-exl3",
++                f"Exl3MoEMethod prefix={prefix!r} "
++                f"r7_graph={getattr(layer, 'exl3_r7_graph', False)} "
++                f"mixed={getattr(layer, 'exl3_mixed_bitrate', False)}",
++            )
+             return Exl3MoEMethod(self, layer.moe_config)
+         return None
+ 
+@@ -1612,6 +1662,11 @@ class Exl3Config(QuantizationConfig):
+             return None
+         args = vllm_config.model_config.quantization_config
+         if not isinstance(args, QuantizationConfigArgs):
++            _audit_path(
++                "online-overlay",
++                "off (model_config.quantization_config is not a "
++                "QuantizationConfigArgs overlay)",
++            )
+             return None
+ 
+         shared_expert = is_shared_expert_projection(prefix)
+@@ -2970,12 +3025,30 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+             # Prefer the native two- or three-tier B12X mixed-Trellis kernel.
+             if _r7_fused_enabled() and self._prepare_r7_b12x_weights(layer):
+                 layer.exl3_r7_fused = True
++                _audit_path(
++                    "prepare-r7-fused",
++                    f"R7 fused B12X mixed-Trellis layer={layer.layer_name}",
++                )
+                 return
++            _audit_path(
++                "prepare-r7-graph",
++                f"R7 graph parity prepare layer={layer.layer_name} "
++                f"fused_enabled={_r7_fused_enabled()}",
++            )
+             self._prepare_r7_graph_weights(layer)
+             return
+         if _rs:
++            _audit_path(
++                "prepare-rank-sliced",
++                f"rank-sliced uniform prepare layer={layer.layer_name}",
++            )
+             self._prepare_rank_sliced_weights(layer)
+             return
++        _audit_path(
++            "prepare-fallthrough",
++            f"no rank-sliced/r7 prepare; stock weight load "
++            f"layer={layer.layer_name}",
++        )
+ 
+     def _validate_codebooks(self, layer: RoutedExperts) -> None:
+         projections = {
+@@ -3387,6 +3460,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+ 
+     def _prepare_rank_sliced_weights(self, layer: RoutedExperts) -> None:
+         if getattr(layer, "exl3_mixed_bitrate", False):
++            _audit_path(
++                "prepare-mixed",
++                f"mixed rank-sliced prepare layer={layer.layer_name} "
++                f"layer_bitrates={getattr(layer, 'exl3_layer_bitrates', None)}",
++            )
+             self._prepare_mixed_rank_sliced_weights(layer)
+             return
+         api = _load_b12x_fused_moe()
+@@ -3460,8 +3538,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+                 use_expert_map=bool(getattr(layer, "exl3_use_ep", False)),
+                 device=w13.device,
+             )
++            _audit_path(
++                "tile-config-uniform",
++                f"b12x select_w4a16_full_rotation_tile_config -> {tile_config}",
++            )
+         else:
+             tile_config = self._trellis_tile_config(hidden_size, intermediate_size)
++            _audit_path(
++                "tile-config-uniform",
++                "heuristic fallback (b12x lacks "
++                f"select_w4a16_full_rotation_tile_config) -> {tile_config}",
++            )
+         weight_plan = api.plan_weights(
+             quant_modes="w4a16",
+             source_format="btx",
+@@ -3512,6 +3599,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+             plan=weight_plan,
+             prepared=native_weights,
+         )
++        _audit_path(
++            "btx-adoption",
++            f"layer={layer.layer_name} bits={bits} experts={num_experts} "
++            f"tile={tile_config}",
++        )
+ 
+         slabs = (
+             w13[0],

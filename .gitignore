@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+cache-rootfs/
+container-tmp/
+
+# personal customizations: anything placed in internal/ stays on this machine
+internal/*
+!internal/.gitkeep
+cache-vllm/
+*.log

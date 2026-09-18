@@ -1,0 +1,39 @@
+diff --git a/vllm/model_executor/layers/quantization/exl3.py b/vllm/model_executor/layers/quantization/exl3.py
+index 07aed40..5ae9787 100644
+--- a/vllm/model_executor/layers/quantization/exl3.py
++++ b/vllm/model_executor/layers/quantization/exl3.py
+@@ -1165,8 +1165,13 @@ class Exl3Config(QuantizationConfig):
+                 "k_values": tuple(normalized_k),
+             }
+         if config.get("scope") == _GLM53_ROUTED_EXPERTS_SCOPE:
++            # 0301: accept the satgeze mixed K3/K4 marker alongside uniform K4.
++            _bits = config.get("bits")
++            if _bits not in (4, "mixed_k34_per_tensor"):
++                raise ValueError(
++                    f"GLM-5.3 routed-only EXL3 bits is unsupported: {_bits!r}"
++                )
+             expected = {
+-                "bits": 4,
+                 "codebook": "mcg",
+                 "non_routed_dtype_policy": "official_source_native",
+             }
+@@ -1565,9 +1570,17 @@ class Exl3Config(QuantizationConfig):
+             )
+ 
+     def _require_enforce_eager(self) -> None:
+-        if self.rank_sliced_metadata is not None:
++        if self.rank_sliced_metadata is not None or (
++            getattr(self, "r7_routed_experts", None) is not None
++        ):
+             # The routed-expert fast path is eagerly planned before graph
+-            # capture. Only its large-M parity fallback remains eager.
++            # capture (mixed-rate paths included: the R7 projection-tier
++            # runtime compiles during the eager profile pass before CUDA
++            # graph capture). Only its large-M parity fallback remains eager.
++            # WITHOUT the r7 term the mixed serve silently boots eager:
++            # 25-30 tok/s, zero graph captures, no error anywhere. The read
++            # is getattr-guarded: r7_routed_experts only exists when the
++            # checkpoint carries the R7 metadata block.
+             return
+         # exllamav3_ext's exl3_gemm autotunes with timing launches on the first
+         # call per (m-bucket, k, n, K) shape hash; under CUDA-graph capture

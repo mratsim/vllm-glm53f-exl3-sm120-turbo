@@ -1,0 +1,33 @@
+diff --git a/vllm/model_executor/layers/quantization/_exl3_btx_adoption.py b/vllm/model_executor/layers/quantization/_exl3_btx_adoption.py
+index 3ce3808..62cc56e 100644
+--- a/vllm/model_executor/layers/quantization/_exl3_btx_adoption.py
++++ b/vllm/model_executor/layers/quantization/_exl3_btx_adoption.py
+@@ -136,3 +136,10 @@ def adopt_prepared_btx_weights(
+         w2_alphas=prepared.w2_global_scale,
+         representation=representation,
+     )
++
++
++# raul2718's b12x-side shim exported the helper as `adopt_btx_weights`
++# (from ._btx_adoption import adopt_prepared_btx_weights as adopt_btx_weights);
++# exl3.py's lazy import (inherited verbatim from his adapter) asks for that
++# name. Keep the alias here so the vllm-side re-home stays drop-in equivalent.
++adopt_btx_weights = adopt_prepared_btx_weights
+diff --git a/vllm/model_executor/layers/quantization/exl3.py b/vllm/model_executor/layers/quantization/exl3.py
+index 218eaab..a7bee11 100644
+--- a/vllm/model_executor/layers/quantization/exl3.py
++++ b/vllm/model_executor/layers/quantization/exl3.py
+@@ -1615,7 +1615,12 @@ class Exl3Config(QuantizationConfig):
+             return None
+ 
+         shared_expert = is_shared_expert_projection(prefix)
+-        spec = args.shared_experts if shared_expert else args.linear
++        if shared_expert:
++            # shared_experts spec only exists on lineages whose
++            # QuantizationConfigArgs grew the field; absent here -> no overlay.
++            spec = getattr(args, "shared_experts", None)
++        else:
++            spec = args.linear
+         if spec is None:
+             return None
+         if (
