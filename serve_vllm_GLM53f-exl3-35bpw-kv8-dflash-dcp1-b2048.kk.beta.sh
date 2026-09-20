@@ -2,13 +2,13 @@
 set -euo pipefail
 
 # ============================================================
-# GLM-5.3-Flash 3.5bpw (satgeze). MTP-3 draft, GPUs split the conversation
+# GLM-5.3-Flash 3.5bpw (satgeze). DFlash2 draft, no conversation split (DCP=1)
 # ============================================================
 
 # ============================================================
 # Image
 # ============================================================
-IMAGE="localhost/vllm-glm53f-exl3-sm120-turbo:r4"
+IMAGE="localhost/vllm-glm53f-exl3-sm120-turbo:r5"
 PODNAME="vllm"
 VLLM_PORT=8000
 
@@ -38,7 +38,7 @@ MODEL_CONTAINER="${MODEL_ROOT}/${MODEL##*/}"
 # Settings
 # ============================================================
 TP_SIZE=2
-DCP_SIZE=2                    # split across GPUs
+DCP_SIZE=1                     # no split. Half the KV space of the -dcp2 file
 GPU_UTIL=0.986                 # weights take about 74 GiB per GPU. Rest is KV cache
 CONTEXT_SIZE=327680
 MAX_NUM_SEQS=6
@@ -47,10 +47,12 @@ MAX_NUM_BATCHED_TOKENS=2048    # prompt tokens per step. Smaller = more KV space
 KV_CACHE_DTYPE=fp8_ds_mla
 BLOCK_SIZE=256
 CP_KV_INTERLEAVE=4             # both split modes use the same value (4)
-# MTP draft, 3 tokens guessed per step. The -dflash files run DFlash2 instead
-MTP_TOKENS=3                  # how many tokens ahead the draft guesses each step
-# MTP needs no special page settings. The draft is part of the model and the normal page width
-# already lines up with the 8448-byte steps
+# DFlash2 draft, 7 tokens guessed per step. The -mtp3 files run MTP instead
+DFLASH_TOKENS=7               # how many tokens ahead the draft guesses each step
+# No split: the draft memory is local, but the page rules below still apply
+DFLASH_MODEL="${LOCAL_MODELS}"/GLM-5.3-Flash-DFlash2-MXFP8
+                              # Small draft model beside the main model.
+                              # Wrong guesses are thrown away, output stays exact
 REASONING_EFFORT=high          # low or high. The template default is max and it talks too much.
 HEALTH_START_PERIOD=600
 
@@ -58,7 +60,7 @@ HEALTH_START_PERIOD=600
 EP_FLAG=()
 
 # Ready-made graph sizes. Spec decoding on: (K+1) x seqs. Off: 4 x seqs
-SPEC_K=${MTP_TOKENS}         # the rule above, with speculative decoding on
+SPEC_K=${DFLASH_TOKENS}      # the rule above, with speculative decoding on
 if (( SPEC_K > 0 ))
 then
     GRAPH_CAP=$(( MAX_NUM_SEQS * (SPEC_K + 1) ))
@@ -111,10 +113,18 @@ VLLM_BACKEND=(
     --linear-backend b12x
 )
 
-# The draft part ships inside the model file
+# Speculative decoding. b12x picks the right kernel for the draft size automatically FLASH_ATTN runs
+# the draft. Tested on these cards, handles its odd layers
+# The draft memory stays BF16. Adds about 0.6 GiB per GPU
+DFLASH_MOUNT=(-v "${DFLASH_MODEL}":/draft:ro)
+# The memory bookkeeping needs pages lined up to 8448-byte
+# steps. The draft breaks that, so pages are split to line
+# up by design. The split width is 4608.
+# Needs mamba-cache-mode align below
+VLLM_ENV+=(-e VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE=4608)
 VLLM_SPEC=(
     --speculative-config \
-    "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_TOKENS},\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"standard\",\"moe_backend\":\"b12x\",\"attention_backend\":\"B12X\"}"
+    "{\"method\":\"dflash\",\"model\":\"/draft\",\"num_speculative_tokens\":${DFLASH_TOKENS},\"draft_tensor_parallel_size\":${TP_SIZE},\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"standard\",\"attention_backend\":\"FLASH_ATTN\",\"kv_cache_dtype\":\"auto\"}"
 )
 
 VLLM_EXTRA+=(
@@ -136,7 +146,7 @@ VLLM_EXTRA+=(
   printf '  quant        exl3 (TR3 mixed K3/K4 per-expert, routed experts only), kv=%s, block=%s\n' "${KV_CACHE_DTYPE}" "${BLOCK_SIZE}"
   printf '  context      %s tokens, mem-fraction=%s\n' "${CONTEXT_SIZE}" "${GPU_UTIL}"
   printf '  batching     max-seqs=%s, batched-tokens=%s, graph-cap=%s\n' "${MAX_NUM_SEQS}" "${MAX_NUM_BATCHED_TOKENS}" "${GRAPH_CAP}"
-  printf '  speculation  mtp3 (K=%s)\n' "${SPEC_K}"
+  printf '  speculation  dflash2 (K=%s)\n' "${SPEC_K}"
   printf '  reasoning    %s\n' "${REASONING_EFFORT}"
 } >&2
 
@@ -160,6 +170,7 @@ podman run --replace --detach --restart=always \
     -v "${HF_CACHE}":/root/.cache/huggingface:ro \
     -v "${DIR}/container-tmp":/container-tmp \
     -v "${DIR}/chat_template.multimodal.jinja":/opt/glm53f/chat_template.multimodal.jinja:ro \
+    "${DFLASH_MOUNT[@]}" \
     -e TMPDIR=/container-tmp \
     "${VLLM_ENV[@]}" \
     "${IMAGE}" \
@@ -196,8 +207,8 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --enable-auto-tool-choice \
             --chat-template /opt/glm53f/chat_template.multimodal.jinja \
             --default-chat-template-kwargs.reasoning_effort="${REASONING_EFFORT}" \
-            `# GLM5Next KDA backends` \
-            --additional-config '{"glm53_kda_decode_backend":"auto","kda_prefill_backend":"b12x"}' \
+            `# b12x KDA prefill auto-engages on karmic` \
+            `# the old kda_prefill_backend key fails the karmic resolver` \
             `# Serving statistics` \
             --enable-request-id-headers \
             --enable-force-include-usage \

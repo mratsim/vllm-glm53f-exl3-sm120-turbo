@@ -28,14 +28,14 @@ names end with the prefill block (pb32 or pb64).
 
 | Script | Checkpoint | Speculation | KV split | Step size | Prefill block |
 |---|---|---|---|---|---|
-| `serve_vllm_GLM53f-exl3-4bpw-kv8-mtp3-dcp2-b2048-pb64.jj.r38.sh` | brandonmusic, uniform K4 | MTP-3 | DCP=2 | 2048 | 64 |
-| `serve_vllm_GLM53f-exl3-4bpw-kv8-mtp3-dcp2-b2048-pb32.jj.r38.sh` | same, prefill block 32 | MTP-3 | DCP=2 | 2048 | 32 |
-| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp1-b2048.jj.r38.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=1 | 2048 | 64 |
-| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp2-b2048.jj.r38.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=2 | 2048 | 64 |
-| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp1-b4096.jj.r38.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=1 | 4096 | 64 |
-| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp2-b4096.jj.r38.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=2 | 4096 | 64 |
-| `serve_vllm_GLM53f-exl3-35bpw-kv8-mtp3-dcp1-b2048.jj.r38.sh` | satgeze, mixed K3/K4 | MTP-3 | DCP=1 | 2048 | 64 |
-| `serve_vllm_GLM53f-exl3-35bpw-kv8-mtp3-dcp2-b2048.jj.r38.sh` | satgeze, mixed K3/K4 | MTP-3 | DCP=2 | 2048 | 64 |
+| `serve_vllm_GLM53f-exl3-4bpw-kv8-mtp3-dcp2-b2048-pb64.kk.beta.sh` | brandonmusic, uniform K4 | MTP-3 | DCP=2 | 2048 | 64 |
+| `serve_vllm_GLM53f-exl3-4bpw-kv8-mtp3-dcp2-b2048-pb32.kk.beta.sh` | same, prefill block 32 | MTP-3 | DCP=2 | 2048 | 32 |
+| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp1-b2048.kk.beta.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=1 | 2048 | 64 |
+| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp2-b2048.kk.beta.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=2 | 2048 | 64 |
+| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp1-b4096.kk.beta.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=1 | 4096 | 64 |
+| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp2-b4096.kk.beta.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=2 | 4096 | 64 |
+| `serve_vllm_GLM53f-exl3-35bpw-kv8-mtp3-dcp1-b2048.kk.beta.sh` | satgeze, mixed K3/K4 | MTP-3 | DCP=1 | 2048 | 64 |
+| `serve_vllm_GLM53f-exl3-35bpw-kv8-mtp3-dcp2-b2048.kk.beta.sh` | satgeze, mixed K3/K4 | MTP-3 | DCP=2 | 2048 | 64 |
 
 All eight: b12x backends, served as `GLM-5.3-Flash`, 327,680 context,
 KV cache dtype `fp8_ds_mla`. The b2048 dflash pair and the two MTP
@@ -94,7 +94,7 @@ What the numbers say so far:
   for dflash, 2.48x for MTP. DCP=1 wins alone, DCP=2 wins with many
   users.
 - How much DCP really multiplies your tokens: 1.71x for MTP, 1.55x for
-  dflash (its draft memory cannot be split). Both below 2 because the
+  dflash (its draft memory cannot be split). Both stay below 2: the
   running-summary memory cannot be split.
 - Raising MAX_NUM_BATCHED_TOKENS from 2048 to 4096 gave +10%
   prefill (4,850 vs 4,400 tok/s) at the same decode. On DCP=2 it
@@ -105,7 +105,7 @@ What the numbers say so far:
 
 | # | Name | What it does |
 |---|---|---|
-| 0101 | exl3-adapter | New files: `exl3.py` (the TR3 adapter, LIL-tree port via raul2718), `exl3_online_cache.py`, `_exl3_btx_adoption.py`. The adoption helper lives vllm-side because upstream b12x has no adopt API (verified 2026-09-17), so b12x stays unpatched. |
+| 0101 | exl3-adapter | New files: `exl3.py` (the TR3 adapter, LIL-tree port via raul2718), `exl3_online_cache.py`, `_exl3_btx_adoption.py`. The adoption helper lives vllm-side: upstream b12x has no adopt API (verified 2026-09-17), so b12x stays unpatched. |
 | 0102 | exl3-quant-registration | Registers the "exl3" quantization method. |
 | 0103 | exl3-config-detection | Claims exl3 configs before ModelOpt (insert only). |
 | 0104 | routed-experts-per-expert-trellis | Per-expert Trellis rank-3 non-fused fix in `routed_experts.py`. |
@@ -134,8 +134,7 @@ What the numbers say so far:
 - Never pass `--generation-config` with a path. It treats the value as
   an HF repo id and fails on local paths. Sampler defaults go through
   `--override-generation-config`. Reasoning effort goes through
-  `--default-chat-template-kwargs.reasoning_effort` (low or high, the
-  template default max talks too much).
+  `--default-chat-template-kwargs.reasoning_effort` (low or high, the template default max talks too much).
 - Expert parallelism needs the unsliced-K4 expert layout, so only the
   4bpw launcher passes `--enable-expert-parallel`.
 - Keep cp/dcp KV interleave sizes equal (4).
@@ -169,14 +168,14 @@ summary) is written once per page no matter how small the page is
 often:
 
 - At page size 512 the cost was 9x per token and the memory pool fell
-  to 797,900 tokens (boot #7d).
-- At page size 4608 the pool holds 1,583,786 tokens (boot #12).
+  to 797,900 tokens (page-splitting experiment).
+- At page size 4608 the pool holds 1,583,786 tokens (measured serving config).
 
 MTP does not need the split: its draft is one shared head
 with almost no KV of its own.
 
 The draft attention must advertise `supports_dcp_replicated`. Only
-`FLASH_ATTN` does at this base commit (`TRITON_ATTN` fails, boot #7).
+`FLASH_ATTN` does at this base commit (`TRITON_ATTN` fails).
 Prefix caching stays on.
 
 ## When the base image updates
@@ -188,8 +187,7 @@ podman pull <new-tag>
 # a failing git apply --check means re-anchor the patches. Never force it.
 ```
 
-The tag follows `<stack-name>:<revision>`. Keep the Dockerfile ARG, the
-podman tag, the script IMAGE lines in sync on every revision bump.
+The tag follows `<stack-name>:<revision>`. Keep the Dockerfile ARG, the podman tag, the script IMAGE lines in sync on every revision bump.
 The Dockerfile stamps the revision into the 0107 log marker and asserts
 the token is fully consumed.
 

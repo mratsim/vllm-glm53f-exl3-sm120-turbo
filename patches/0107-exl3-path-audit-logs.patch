@@ -155,7 +155,7 @@ index a7bee11..07aed40 100644
              self._prepare_mixed_rank_sliced_weights(layer)
              return
          api = _load_b12x_fused_moe()
-@@ -3460,8 +3538,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+@@ -3465,12 +3543,21 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                  use_expert_map=bool(getattr(layer, "exl3_use_ep", False)),
                  device=w13.device,
              )
@@ -170,7 +170,11 @@ index a7bee11..07aed40 100644
 +                "heuristic fallback (b12x lacks "
 +                f"select_w4a16_full_rotation_tile_config) -> {tile_config}",
 +            )
-         weight_plan = api.plan_weights(
+         # The karmic B12X deleted the _vllm_compat plan_weights overload
+         # that accepted the quant_modes form. The canonical planner
+         # lives on the same package's _impl submodule, one b12x entry
+         # point kept, uniform rate granularity stays the default.
+         weight_plan = api._impl.plan_b12x_fp4_moe_weights(
              quant_modes="w4a16",
              source_format="btx",
 @@ -3512,6 +3599,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):

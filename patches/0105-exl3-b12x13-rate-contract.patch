@@ -11,21 +11,3 @@ index fd19ee9..3ce3808 100644
          or plan.trellis_pair_kinds is not None
          or trellis.fc1_pair_kind is not None
          or trellis.fc2_pair_kind is not None
-diff --git a/vllm/model_executor/layers/quantization/exl3.py b/vllm/model_executor/layers/quantization/exl3.py
-index 1e77f01..9e039d0 100644
---- a/vllm/model_executor/layers/quantization/exl3.py
-+++ b/vllm/model_executor/layers/quantization/exl3.py
-@@ -3478,7 +3478,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
-             trellis_bits=bits,
-             trellis_tile_config=tile_config,
-             trellis_codebook="mcg",
--            trellis_rate_structure="uniform",
-+            # B12X 1.3 removed the rate-structure kwarg from its vLLM
-+            # compatibility plan (the pre-1.3 verdictai-era contract Brandon's
-+            # adapter still speaks). Only uniform is meaningful here and 1.3
-+            # defaults to uniform when the kwarg is absent, so we omit it
-+            # (raul2718's b12x-side shim pops and drops it; this is the
-+            # vllm-side equivalent, keeping b12x unpatched).
-         )
-         native_weights = native_api.prepare_weights(
-             w13=w13,

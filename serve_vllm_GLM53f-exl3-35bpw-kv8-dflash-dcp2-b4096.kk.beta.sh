@@ -2,15 +2,14 @@
 set -euo pipefail
 
 # ============================================================
-# GLM-5.3-Flash 3.5bpw (satgeze). DFlash2 draft, no
-# conversation split (DCP=1). Wider batching: 4096
-# tokens per step
+# GLM-5.3-Flash 3.5bpw (satgeze). DFlash2 draft, GPUs split the conversation. Wider batching: 4096 tokens
+# per step
 # ============================================================
 
 # ============================================================
 # Image
 # ============================================================
-IMAGE="localhost/vllm-glm53f-exl3-sm120-turbo:r4"
+IMAGE="localhost/vllm-glm53f-exl3-sm120-turbo:r5"
 PODNAME="vllm"
 VLLM_PORT=8000
 
@@ -40,8 +39,8 @@ MODEL_CONTAINER="${MODEL_ROOT}/${MODEL##*/}"
 # Settings
 # ============================================================
 TP_SIZE=2
-DCP_SIZE=1                     # no split. Half the KV space of the -dcp2 file
-GPU_UTIL=0.95                 # weights take about 74 GiB per GPU. MNBT 4096 scratch needs headroom
+DCP_SIZE=2                     # the GPUs split the saved conversation (~2x KV space)
+GPU_UTIL=0.96                 # weights take about 74 GiB per GPU. MNBT 4096 scratch needs headroom
 CONTEXT_SIZE=327680
 MAX_NUM_SEQS=6
 MAX_NUM_BATCHED_TOKENS=4096    # prompt tokens per step. Wider = faster prefill, bigger scratch
@@ -51,7 +50,8 @@ BLOCK_SIZE=256
 CP_KV_INTERLEAVE=4             # both split modes use the same value (4)
 # DFlash2 draft, 7 tokens guessed per step. The -mtp3 files run MTP instead
 DFLASH_TOKENS=7               # how many tokens ahead the draft guesses each step
-# No split: the draft memory is local, but the page rules below still apply
+# The draft memory cannot be split, so both GPUs keep a full
+# copy. The page settings below keep the memory sizes lined up (boots #7b to #7d)
 DFLASH_MODEL="${LOCAL_MODELS}"/GLM-5.3-Flash-DFlash2-MXFP8
                               # Small draft model beside the main model.
                               # Wrong guesses are thrown away, output stays exact
@@ -116,8 +116,8 @@ VLLM_BACKEND=(
 )
 
 # Speculative decoding. b12x picks the right kernel for the draft size automatically FLASH_ATTN runs
-# the draft. Tested on these cards, handles its odd layers
-# The draft memory stays BF16. Adds about 0.6 GiB per GPU
+# the draft. The only draft code that supports the split The
+# draft memory stays BF16. Adds about 0.6 GiB per GPU
 DFLASH_MOUNT=(-v "${DFLASH_MODEL}":/draft:ro)
 # The memory bookkeeping needs pages lined up to 8448-byte
 # steps. The draft breaks that, so pages are split to line
@@ -209,8 +209,8 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --enable-auto-tool-choice \
             --chat-template /opt/glm53f/chat_template.multimodal.jinja \
             --default-chat-template-kwargs.reasoning_effort="${REASONING_EFFORT}" \
-            `# GLM5Next KDA backends` \
-            --additional-config '{"glm53_kda_decode_backend":"auto","kda_prefill_backend":"b12x"}' \
+            `# b12x KDA prefill auto-engages on karmic` \
+            `# the old kda_prefill_backend key fails the karmic resolver` \
             `# Serving statistics` \
             --enable-request-id-headers \
             --enable-force-include-usage \

@@ -2,13 +2,13 @@
 set -euo pipefail
 
 # ============================================================
-# GLM-5.3-Flash 3.5bpw (satgeze). MTP-3 draft, no conversation split (DCP=1)
+# GLM-5.3-Flash 3.5bpw (satgeze). MTP-3 draft, GPUs split the conversation
 # ============================================================
 
 # ============================================================
 # Image
 # ============================================================
-IMAGE="localhost/vllm-glm53f-exl3-sm120-turbo:r4"
+IMAGE="localhost/vllm-glm53f-exl3-sm120-turbo:r5"
 PODNAME="vllm"
 VLLM_PORT=8000
 
@@ -38,7 +38,7 @@ MODEL_CONTAINER="${MODEL_ROOT}/${MODEL##*/}"
 # Settings
 # ============================================================
 TP_SIZE=2
-DCP_SIZE=1                    # no split. Draft memory stays local
+DCP_SIZE=2                    # split across GPUs
 GPU_UTIL=0.986                 # weights take about 74 GiB per GPU. Rest is KV cache
 CONTEXT_SIZE=327680
 MAX_NUM_SEQS=6
@@ -46,7 +46,7 @@ MAX_NUM_BATCHED_TOKENS=2048    # prompt tokens per step. Smaller = more KV space
                                # Bigger = faster long-prompt reading
 KV_CACHE_DTYPE=fp8_ds_mla
 BLOCK_SIZE=256
-CP_KV_INTERLEAVE=4             # the split-off mode drops the dcp flag
+CP_KV_INTERLEAVE=4             # both split modes use the same value (4)
 # MTP draft, 3 tokens guessed per step. The -dflash files run DFlash2 instead
 MTP_TOKENS=3                  # how many tokens ahead the draft guesses each step
 # MTP needs no special page settings. The draft is part of the model and the normal page width
@@ -181,6 +181,7 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --tensor-parallel-size "${TP_SIZE}" \
             --decode-context-parallel-size "${DCP_SIZE}" \
             --cp-kv-cache-interleave-size "${CP_KV_INTERLEAVE}" \
+            --dcp-kv-cache-interleave-size "${CP_KV_INTERLEAVE}" \
             "${EP_FLAG[@]}" \
             `# Resource limits` \
             --gpu-memory-utilization "${GPU_UTIL}" \
@@ -195,8 +196,8 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --enable-auto-tool-choice \
             --chat-template /opt/glm53f/chat_template.multimodal.jinja \
             --default-chat-template-kwargs.reasoning_effort="${REASONING_EFFORT}" \
-            `# GLM5Next KDA backends` \
-            --additional-config '{"glm53_kda_decode_backend":"auto","kda_prefill_backend":"b12x"}' \
+            `# b12x KDA prefill auto-engages on karmic` \
+            `# the old kda_prefill_backend key fails the karmic resolver` \
             `# Serving statistics` \
             --enable-request-id-headers \
             --enable-force-include-usage \

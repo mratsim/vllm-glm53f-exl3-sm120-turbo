@@ -1,0 +1,25 @@
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index fa308b65fe..71fc11d7ea 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -948,6 +948,20 @@ class Worker(WorkerBase):
+             # A workspace resize after capture frees what the graphs point at.
+             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+ 
++        # 0111: B12X preparation jobs end with evict_unretained(keep), which
++        # drops every raw Triton JIT entry the EXL3 route-pack warmup produced
++        # at runtime construction, so the guarded capture froze on the first
++        # unwarmed specialization (r5 boot 2, capture desc 5). Re-run the
++        # warmup here, after the last preparation job and kernel warmup, so
++        # these launches are the final writer of the route-pack JIT cache
++        # before capture begins. No-op for models without a mixed-bitrate
++        # EXL3 runtime.
++        if not self.model_config.enforce_eager:
++            from vllm.model_executor.layers.quantization.exl3 import (
++                rewarm_mixed_route_packs,
++            )
++            rewarm_mixed_route_packs()
++
+         cuda_graph_memory_bytes = 0
+         if not self.model_config.enforce_eager:
+             # Under capture the b12x session refuses kernel resolution and an

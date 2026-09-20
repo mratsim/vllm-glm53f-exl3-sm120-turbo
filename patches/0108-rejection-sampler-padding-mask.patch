@@ -1,0 +1,17 @@
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 609924e87f..cd40fcb19c 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -295,6 +295,12 @@ class RejectionSampler:
+         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
+ 
+         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
++        # Padded rows hold garbage in input_ids. Mask them to the -1
++        # placeholder so verification rejects there instead of treating a
++        # random padded draft token as a real sample.
++        draft_sampled.masked_fill_(
++            input_batch.is_padding[input_batch.logits_indices], -1
++        )
+         pos = input_batch.positions[input_batch.logits_indices]
+ 
+         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
