@@ -2,15 +2,13 @@
 set -euo pipefail
 
 # ============================================================
-# GLM-5.3-Flash 3.5bpw (satgeze). DFlash2 draft, no
-# conversation split (DCP=1). Comparison partner for
-# -dflash-dcp2. Page rules below still apply (boot #7c)
+# GLM-5.3-Flash 3.5bpw (satgeze). DFlash2 draft, no conversation split (DCP=1)
 # ============================================================
 
 # ============================================================
 # Image
 # ============================================================
-IMAGE="localhost/vllm-glm53f-exl3-sm120-turbo:r4"
+IMAGE="localhost/vllm-glm53f-exl3-sm120-turbo:r5"
 PODNAME="vllm"
 VLLM_PORT=8000
 
@@ -24,7 +22,7 @@ LOCAL_MODELS="${LOCAL_MODELS:-$HOME/local_models}"
 DIR=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
 ROOTFS_CACHE="${DIR}/cache-rootfs"
 
-mkdir -p "${HF_CACHE}" "${ROOTFS_CACHE}"
+mkdir -p "${HF_CACHE}" "${ROOTFS_CACHE}/triton" "${ROOTFS_CACHE}/inductor" "${ROOTFS_CACHE}/b12x"
 mkdir -p "${DIR}/container-tmp"
 
 # ============================================================
@@ -42,7 +40,7 @@ MODEL_CONTAINER="${MODEL_ROOT}/${MODEL##*/}"
 TP_SIZE=2
 DCP_SIZE=1                     # no split. Half the KV space of the -dcp2 file
 GPU_UTIL=0.986                 # weights take about 74 GiB per GPU. Rest is KV cache
-CONTEXT_SIZE=327680
+CONTEXT_SIZE=-1                      # auto: the model cap (1,048,576) clamped by the KV pool
 MAX_NUM_SEQS=6
 MAX_NUM_BATCHED_TOKENS=2048    # prompt tokens per step. Smaller = more KV space.
                                # Bigger = faster long-prompt reading
@@ -51,8 +49,7 @@ BLOCK_SIZE=256
 CP_KV_INTERLEAVE=4             # both split modes use the same value (4)
 # DFlash2 draft, 7 tokens guessed per step. The -mtp3 files run MTP instead
 DFLASH_TOKENS=7               # how many tokens ahead the draft guesses each step
-# No split: the draft memory is local, but the page rules below still
-# apply (boot #7c crashed the same way without the split)
+# No split: the draft memory is local, but the page rules below still apply
 DFLASH_MODEL="${LOCAL_MODELS}"/GLM-5.3-Flash-DFlash2-MXFP8
                               # Small draft model beside the main model.
                               # Wrong guesses are thrown away, output stays exact
@@ -96,7 +93,7 @@ VLLM_EXTRA=()
 VLLM_ENV+=(
     -e VLLM_ENGINE_READY_TIMEOUT_S=${HEALTH_START_PERIOD}
     -e VLLM_ENGINE_ITERATION_TIMEOUT_S=120
-    -e OMP_NUM_THREADS=1
+    -e OMP_NUM_THREADS=4
     -e HF_HUB_OFFLINE=1
     -e SAFETENSORS_FAST_GPU=1
     -e VLLM_USE_V2_MODEL_RUNNER=1
@@ -122,7 +119,7 @@ VLLM_BACKEND=(
 DFLASH_MOUNT=(-v "${DFLASH_MODEL}":/draft:ro)
 # The memory bookkeeping needs pages lined up to 8448-byte
 # steps. The draft breaks that, so pages are split to line
-# up by design. Width 4608 beats 512 (boot #7d).
+# up by design. The split width is 4608.
 # Needs mamba-cache-mode align below
 VLLM_ENV+=(-e VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE=4608)
 VLLM_SPEC=(
@@ -132,9 +129,6 @@ VLLM_SPEC=(
 
 VLLM_EXTRA+=(
     --disable-custom-all-reduce
-    --enable-chunked-prefill
-    --enable-prefix-caching
-    --enable-prompt-tokens-details
     --prefill-compute-share 0.4
     --prefill-schedule-interval 1
     --mm-encoder-attn-backend TORCH_SDPA
@@ -162,8 +156,7 @@ VLLM_EXTRA+=(
 
 podman run --replace --detach --restart=always \
     --entrypoint /bin/bash \
-    --health-cmd="python3 -c \"import urllib.request as u
-u.request.urlopen('http://localhost:${VLLM_PORT}/health', timeout=3).read()\"" \
+    --health-cmd="curl -f http://localhost:${VLLM_PORT}/health || exit 1" \
     --health-start-period="${HEALTH_START_PERIOD}s" \
     --health-interval=30s \
     --health-on-failure=kill \
@@ -179,6 +172,9 @@ u.request.urlopen('http://localhost:${VLLM_PORT}/health', timeout=3).read()\"" \
     -v "${DIR}/chat_template.multimodal.jinja":/opt/glm53f/chat_template.multimodal.jinja:ro \
     "${DFLASH_MOUNT[@]}" \
     -e TMPDIR=/container-tmp \
+    -e TRITON_CACHE_DIR=/cache/triton \
+    -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor \
+    -e B12X_COMPILE_CACHE_DIR=/cache/b12x \
     "${VLLM_ENV[@]}" \
     "${IMAGE}" \
         -lc 'unset MAX_NUM_BATCHED_TOKENS MAX_CUDAGRAPH_CAPTURE_SIZE CUDAGRAPH_CAPTURE_SIZES PREFILL_SCHEDULE_INTERVAL FAIRNESS_ENGINE PREFILL_COMPUTE_SHARE VLLM_PCIE_ALLREDUCE_BACKEND VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE
@@ -189,13 +185,14 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --port "${VLLM_PORT}" \
             `# Model identity` \
             --served-model-name "${MODELNAME}" \
-            --trust-remote-code \
-            --load-format safetensors \
             `# Quantization` \
             --quantization exl3 \
             --dtype bfloat16 \
             --kv-cache-dtype "${KV_CACHE_DTYPE}" \
             --block-size "${BLOCK_SIZE}" \
+            # TODO: explore --mamba-ssm-cache-dtype bfloat16
+            # to divide the cache fixed cost by 2 (verify via the
+            # rebalance line's max-request cost before adoption)
             --mamba-cache-mode align \
             `# Parallelism` \
             --tensor-parallel-size "${TP_SIZE}" \
@@ -215,14 +212,14 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --tool-call-parser glm47 \
             --enable-auto-tool-choice \
             --chat-template /opt/glm53f/chat_template.multimodal.jinja \
-            --default-chat-template-kwargs.thinking=true \
             --default-chat-template-kwargs.reasoning_effort="${REASONING_EFFORT}" \
-            `# GLM5Next KDA backends` \
-            --additional-config '{"glm53_kda_decode_backend":"auto","kda_prefill_backend":"b12x"}' \
+            `# b12x KDA prefill auto-engages on karmic` \
+            `# the old kda_prefill_backend key fails the karmic resolver` \
             `# Serving statistics` \
             --enable-request-id-headers \
             --enable-force-include-usage \
             --enable-per-request-metrics \
+            --enable-prompt-tokens-details \
             "${VLLM_BACKEND[@]}" \
             "${VLLM_EXTRA[@]}" \
             "${VLLM_SPEC[@]}" \

@@ -1,13 +1,12 @@
 #!/bin/bash
+# GLM-5.3-Flash 4bpw (brandonmusic). 8-bit KV cache, MTP-3,
+# GPUs split (DCP=2). Keeps the default prefill block size 64
 set -euo pipefail
 
 # ============================================================
-# GLM-5.3-Flash 4bpw (brandonmusic). 8-bit KV cache, MTP-3, GPUs split (DCP=2)
-# prefill block 32
-# ============================================================
 # Image
 # ============================================================
-IMAGE="localhost/vllm-glm53f-exl3-sm120-turbo:r4"
+IMAGE="localhost/vllm-glm53f-exl3-sm120-turbo:r5"
 PODNAME="vllm"
 VLLM_PORT=8000
 
@@ -21,7 +20,7 @@ LOCAL_MODELS="${LOCAL_MODELS:-$HOME/local_models}"
 DIR=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
 ROOTFS_CACHE="${DIR}/cache-rootfs"
 
-mkdir -p "${HF_CACHE}" "${ROOTFS_CACHE}"
+mkdir -p "${HF_CACHE}" "${ROOTFS_CACHE}/triton" "${ROOTFS_CACHE}/inductor" "${ROOTFS_CACHE}/b12x"
 mkdir -p "${DIR}/container-tmp"
 
 # ============================================================
@@ -38,8 +37,8 @@ MODEL_CONTAINER="${MODEL_ROOT}/${MODEL##*/}"
 # ============================================================
 TP_SIZE=2
 DCP_SIZE=2                     # the GPUs split the saved conversation (~2x KV space)
-GPU_UTIL=0.98                  # 0.95 leaves nothing for the KV cache here
-CONTEXT_SIZE=327680
+GPU_UTIL=0.97                  # ~3% headroom: serving-time Triton JIT OOMs at 0.986 (r5 boot 5)
+CONTEXT_SIZE=-1                      # auto: the model cap (1,048,576) clamped by the KV pool
 MAX_NUM_SEQS=6
 MAX_NUM_BATCHED_TOKENS=1024    # prompt tokens per step. Smaller = more KV space
 KV_CACHE_DTYPE=fp8_ds_mla
@@ -49,8 +48,9 @@ MTP_TOKENS=3                   # the MTP draft part ships inside the model file
 REASONING_EFFORT=high          # low or high. The template default is max and it talks too much.
 HEALTH_START_PERIOD=600
 
-# Expert parallelism. Each GPU keeps 144 whole experts (this checkpoint only)
-EP_FLAG=(--enable-expert-parallel)
+# Expert parallelism is GONE from the karmic b12x runtime surface (the new
+# plan_execution contract has no expert maps). Uniform-K4 runs TP-sharded.
+EP_FLAG=()
 
 # Ready-made graph sizes. Spec decoding on: (K+1) x seqs. Off: 4 x seqs
 if (( MTP_TOKENS > 0 ))
@@ -85,14 +85,20 @@ VLLM_EXTRA=()
 VLLM_ENV+=(
     -e VLLM_ENGINE_READY_TIMEOUT_S=${HEALTH_START_PERIOD}
     -e VLLM_ENGINE_ITERATION_TIMEOUT_S=120
-    -e OMP_NUM_THREADS=1
+    -e OMP_NUM_THREADS=4
     -e HF_HUB_OFFLINE=1
     -e SAFETENSORS_FAST_GPU=1
     -e VLLM_USE_V2_MODEL_RUNNER=1
     -e VLLM_ENABLE_PCIE_ALLREDUCE=0
     -e NCCL_P2P_DISABLE=1
-    -e VLLM_EXL3_PREFILL_BLOCK_M=32
+    # EXL3 settings. Also set inside the image
+    -e VLLM_EXL3_PREFILL_BLOCK_M=64
     -e VLLM_EXL3_PREFILL_TRELLIS=1
+    # The uniform-K4 compile factory primes its real-launch variants with
+    # live CUDA tensors. That only works in-process: pool workers hide
+    # CUDA (r5 boots 9+10). 0 = compile_in_process, the mode the
+    # full-rotation prewarm is designed for.
+    -e B12X_COMPILE_WORKERS=0
     -e VLLM_GLM53_MTP_DRAFT_HEAD=bf16
     -e CUBLAS_WORKSPACE_CONFIG=:4096:1
 )
@@ -115,9 +121,6 @@ fi
 
 VLLM_EXTRA+=(
     --disable-custom-all-reduce
-    --enable-chunked-prefill
-    --enable-prefix-caching
-    --enable-prompt-tokens-details
     --prefill-compute-share 0.4
     --prefill-schedule-interval 1
     --mm-encoder-attn-backend TORCH_SDPA
@@ -131,12 +134,11 @@ VLLM_EXTRA+=(
 {
   printf 'launch %s as %s\n' "${MODEL_CONTAINER}" "${MODELNAME}"
   printf '  image        %s\n' "${IMAGE}"
-  printf '  parallel     tp=%s dcp=%s ep=yes\n' "${TP_SIZE}" "${DCP_SIZE}"
+  printf '  parallel     tp=%s dcp=%s ep=no (uniform K4: TP2 sharded experts)\n' "${TP_SIZE}" "${DCP_SIZE}"
   printf '  quant        exl3 (TR3 uniform K4, routed experts only), kv=%s, block=%s\n' "${KV_CACHE_DTYPE}" "${BLOCK_SIZE}"
   printf '  context      %s tokens, mem-fraction=%s\n' "${CONTEXT_SIZE}" "${GPU_UTIL}"
   printf '  batching     max-seqs=%s, batched-tokens=%s, graph-cap=%s\n' "${MAX_NUM_SEQS}" "${MAX_NUM_BATCHED_TOKENS}" "${GRAPH_CAP}"
   printf '  speculation  mtp (K=%s, probabilistic)\n' "${MTP_TOKENS}"
-  printf '  exl3-prefill block size: 32 (kernel claim only, end-to-end slower than 64)\n'
   printf '  reasoning    %s\n' "${REASONING_EFFORT}"
 } >&2
 
@@ -146,8 +148,7 @@ VLLM_EXTRA+=(
 
 podman run --replace --detach --restart=always \
     --entrypoint /bin/bash \
-    --health-cmd="python3 -c \"import urllib.request as u
-u.request.urlopen('http://localhost:${VLLM_PORT}/health', timeout=3).read()\"" \
+    --health-cmd="curl -f http://localhost:${VLLM_PORT}/health || exit 1" \
     --health-start-period="${HEALTH_START_PERIOD}s" \
     --health-interval=30s \
     --health-on-failure=kill \
@@ -162,6 +163,9 @@ u.request.urlopen('http://localhost:${VLLM_PORT}/health', timeout=3).read()\"" \
     -v "${DIR}/container-tmp":/container-tmp \
     -v "${DIR}/chat_template.multimodal.jinja":/opt/glm53f/chat_template.multimodal.jinja:ro \
     -e TMPDIR=/container-tmp \
+    -e TRITON_CACHE_DIR=/cache/triton \
+    -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor \
+    -e B12X_COMPILE_CACHE_DIR=/cache/b12x \
     "${VLLM_ENV[@]}" \
     "${IMAGE}" \
         -lc 'unset MAX_NUM_BATCHED_TOKENS MAX_CUDAGRAPH_CAPTURE_SIZE CUDAGRAPH_CAPTURE_SIZES PREFILL_SCHEDULE_INTERVAL FAIRNESS_ENGINE PREFILL_COMPUTE_SHARE VLLM_PCIE_ALLREDUCE_BACKEND VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE
@@ -172,13 +176,14 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --port "${VLLM_PORT}" \
             `# Model identity` \
             --served-model-name "${MODELNAME}" \
-            --trust-remote-code \
-            --load-format safetensors \
             `# Quantization` \
             --quantization exl3 \
             --dtype bfloat16 \
             --kv-cache-dtype "${KV_CACHE_DTYPE}" \
             --block-size "${BLOCK_SIZE}" \
+            # TODO: explore --mamba-ssm-cache-dtype bfloat16
+            # to divide the cache fixed cost by 2 (verify via the
+            # rebalance line's max-request cost before adoption)
             --mamba-cache-mode align \
             `# Parallelism` \
             --tensor-parallel-size "${TP_SIZE}" \
@@ -198,14 +203,14 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --tool-call-parser glm47 \
             --enable-auto-tool-choice \
             --chat-template /opt/glm53f/chat_template.multimodal.jinja \
-            --default-chat-template-kwargs.thinking=true \
             --default-chat-template-kwargs.reasoning_effort="${REASONING_EFFORT}" \
-            `# GLM5Next KDA backends` \
-            --additional-config '{"glm53_kda_decode_backend":"auto","kda_prefill_backend":"b12x"}' \
+            `# b12x KDA prefill auto-engages on karmic` \
+            `# the old kda_prefill_backend key fails the karmic resolver` \
             `# Serving statistics` \
             --enable-request-id-headers \
             --enable-force-include-usage \
             --enable-per-request-metrics \
+            --enable-prompt-tokens-details \
             "${VLLM_BACKEND[@]}" \
             "${VLLM_EXTRA[@]}" \
             "${VLLM_SPEC[@]}" \

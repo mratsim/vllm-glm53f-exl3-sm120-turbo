@@ -28,20 +28,68 @@ names end with the prefill block (pb32 or pb64).
 
 | Script | Checkpoint | Speculation | KV split | Step size | Prefill block |
 |---|---|---|---|---|---|
-| `serve_vllm_GLM53f-exl3-4bpw-kv8-mtp3-dcp2-b2048-pb64.jj.r38.sh` | brandonmusic, uniform K4 | MTP-3 | DCP=2 | 2048 | 64 |
-| `serve_vllm_GLM53f-exl3-4bpw-kv8-mtp3-dcp2-b2048-pb32.jj.r38.sh` | same, prefill block 32 | MTP-3 | DCP=2 | 2048 | 32 |
-| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp1-b2048.jj.r38.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=1 | 2048 | 64 |
-| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp2-b2048.jj.r38.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=2 | 2048 | 64 |
-| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp1-b4096.jj.r38.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=1 | 4096 | 64 |
-| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp2-b4096.jj.r38.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=2 | 4096 | 64 |
-| `serve_vllm_GLM53f-exl3-35bpw-kv8-mtp3-dcp1-b2048.jj.r38.sh` | satgeze, mixed K3/K4 | MTP-3 | DCP=1 | 2048 | 64 |
-| `serve_vllm_GLM53f-exl3-35bpw-kv8-mtp3-dcp2-b2048.jj.r38.sh` | satgeze, mixed K3/K4 | MTP-3 | DCP=2 | 2048 | 64 |
+| `serve_vllm_GLM53f-exl3-4bpw-kv8-mtp3-dcp2-b2048-pb64.kk.beta.sh` | brandonmusic, uniform K4 | MTP-3 | DCP=2 | 2048 | 64 |
+| `serve_vllm_GLM53f-exl3-4bpw-kv8-mtp3-dcp2-b2048-pb32.kk.beta.sh` | same, prefill block 32 | MTP-3 | DCP=2 | 2048 | 32 |
+| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp1-b2048.kk.beta.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=1 | 2048 | 64 |
+| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp2-b2048.kk.beta.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=2 | 2048 | 64 |
+| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp1-b4096.kk.beta.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=1 | 4096 | 64 |
+| `serve_vllm_GLM53f-exl3-35bpw-kv8-dflash-dcp2-b4096.kk.beta.sh` | satgeze, mixed K3/K4 | DFlash2-7 | DCP=2 | 4096 | 64 |
+| `serve_vllm_GLM53f-exl3-35bpw-kv8-mtp3-dcp1-b2048.kk.beta.sh` | satgeze, mixed K3/K4 | MTP-3 | DCP=1 | 2048 | 64 |
+| `serve_vllm_GLM53f-exl3-35bpw-kv8-mtp3-dcp2-b2048.kk.beta.sh` | satgeze, mixed K3/K4 | MTP-3 | DCP=2 | 2048 | 64 |
 
-All eight: b12x backends, served as `GLM-5.3-Flash`, 327,680 context,
-KV cache dtype `fp8_ds_mla`. The b2048 dflash pair and the two MTP
-scripts form a 2x2 grid: two speculation modes times two split sizes.
-Any two cells differ in exactly one thing, so comparisons are clean.
-The b4096 dflash pair is the wider-step variant of the grid.
+All eight run the b12x backends. They serve as `GLM-5.3-Flash` with
+auto context (`max-model-len -1`: the model cap of 1,048,576 clamped
+by the KV pool) and KV cache dtype `fp8_ds_mla`. The b2048 dflash
+pair and the two MTP scripts form a 2x2 grid: two speculation modes
+times two split sizes. Any two cells differ in exactly one thing so
+comparisons are clean. The b4096 dflash pair is the wider-step
+variant of the grid.
+
+### The KV pool, context size, concurrency
+
+The scripts reserve the KV pool (`kv-cache-memory-bytes`, 3.9 GiB
+per GPU on the NVFP4 preset) and leave `max-model-len` at `-1`
+(auto). Two numbers come out of that. Both move with the settings:
+
+- **Per-request cost** = `A * length + F`. `A` is the per-token KV
+  cost (about 3,366 bytes per token per GPU at fp8 with DCP2 after
+  the cache-group rebalance). `F` is the fixed per-request state
+  (GDN/mamba checkpoint bundles, about 0.9 GiB at the 4-sequence
+  worst case). The pool holds `pool / cost` concurrent requests.
+- **The reported "GPU KV cache size"** is `pool / (A + F/cap)`, where
+  cap is `max-model-len`. The fixed per-request state is amortized
+  over the cap, so a bigger cap reports a bigger number for the same
+  pool: a 327,680 cap reported 661,913 tokens, the 1,048,576 cap
+  reports 953,418. Concurrency at any given length stays the same
+  (about 2 requests of 327,680 either way). What the cap really sets
+  is the longest single request the server admits.
+
+Example mixes on the 3.9 GiB pool (per GPU, engine reservation
+arithmetic):
+
+| Mix | Cost | Fits |
+|---|---|---|
+| 1 x 950,272 tokens | 3.88 GiB | yes (1.00x) |
+| 2 x 327,680 tokens | 3.85 GiB | yes (2.02x) |
+| 3 x 327,680 tokens | 5.78 GiB | no |
+| 4 x 163,840 tokens | 5.65 GiB | no |
+| 4 x 131,072 tokens | 5.24 GiB | no |
+| 4 x 65,536 tokens | 4.42 GiB | no (close) |
+| 3 x 65,536 tokens | 3.31 GiB | yes |
+| 4 x 32,768 tokens | 3.98 GiB | no (hair over) |
+| 3 x 32,768 tokens | 3.00 GiB | yes |
+
+Concurrency is expensive per request: every extra concurrent
+request adds its own fixed state bundle on top of its token cost. The `F` above is
+the worst case (full 4-sequence bundle), so lighter mixes come out
+slightly better than this arithmetic.
+
+> [!TODO]
+> Explore `--mamba-ssm-cache-dtype bfloat16`. The SSM state runs fp32
+> by default (auto resolves to float32 for KDA) and the flag halves
+> those bytes. The raw states are a small slice of `F`, so measure
+> the effect on the rebalance line's max-request cost before
+> adoption.
 
 Two words explained:
 
@@ -54,6 +102,18 @@ Two words explained:
 
 ## Measured results
 
+> [!WARNING]
+> **Every number in this section was measured on the previous base image**
+> `jovian-judgement-community-20260914-r38`
+> (vLLM built from `lil-vllm` `dev/jovian-judgement` at commit
+> [`66c29357`](https://github.com/local-inference-lab/lil-vllm), the image
+> banner commit, with the checkout tip at `5bca5a58d9`). The stack has since
+> moved to the **`karmic-kraken-beta` base** (vLLM wheel built from source
+> commit `67bb922f6f4` on `integration/karmic-kraken-beta`, b12x at
+> `eea3ced11fc1`). Those numbers have **not** been re-measured on the
+> karmic base. Treat them as indicative of the r38 rig behavior until
+> the karmic re-benchmark numbers exist.
+
 All numbers measured on this rig: two RTX PRO 6000 Blackwell cards on
 the NVIDIA open kernel driver, PCIe gen5 x8/x8, power-limited to
 360 W per GPU.
@@ -65,8 +125,9 @@ so card-to-card traffic crosses the CPU over host NCCL (the launchers
 set `NCCL_P2P_DISABLE=1` with `VLLM_ENABLE_PCIE_ALLREDUCE=0` for this).
 
 Benchmarked with [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench).
-External prefill claims run higher power envelopes (cstechdev 400 W,
-Raul2718 500 W).
+
+External prefill claims run higher power envelopes (cstechdev 400 W
+and Raul2718 500 W).
 
 | Checkpoint | Speculation | KV split | Step size | Prefill block M | KV pool | KV tokens | Chats @ 327,680 | prefill tok/s | decode tok/s |
 |---|---|---|---|---|---|---|---|---|---|
@@ -94,7 +155,7 @@ What the numbers say so far:
   for dflash, 2.48x for MTP. DCP=1 wins alone, DCP=2 wins with many
   users.
 - How much DCP really multiplies your tokens: 1.71x for MTP, 1.55x for
-  dflash (its draft memory cannot be split). Both below 2 because the
+  dflash (its draft memory cannot be split). Both stay below 2: the
   running-summary memory cannot be split.
 - Raising MAX_NUM_BATCHED_TOKENS from 2048 to 4096 gave +10%
   prefill (4,850 vs 4,400 tok/s) at the same decode. On DCP=2 it
@@ -105,7 +166,7 @@ What the numbers say so far:
 
 | # | Name | What it does |
 |---|---|---|
-| 0101 | exl3-adapter | New files: `exl3.py` (the TR3 adapter, LIL-tree port via raul2718), `exl3_online_cache.py`, `_exl3_btx_adoption.py`. The adoption helper lives vllm-side because upstream b12x has no adopt API (verified 2026-09-17), so b12x stays unpatched. |
+| 0101 | exl3-adapter | New files: `exl3.py` (the TR3 adapter, LIL-tree port via raul2718), `exl3_online_cache.py`, `_exl3_btx_adoption.py`. The adoption helper lives vllm-side: upstream b12x has no adopt API (verified 2026-09-17), so b12x stays unpatched. |
 | 0102 | exl3-quant-registration | Registers the "exl3" quantization method. |
 | 0103 | exl3-config-detection | Claims exl3 configs before ModelOpt (insert only). |
 | 0104 | routed-experts-per-expert-trellis | Per-expert Trellis rank-3 non-fused fix in `routed_experts.py`. |
@@ -134,8 +195,7 @@ What the numbers say so far:
 - Never pass `--generation-config` with a path. It treats the value as
   an HF repo id and fails on local paths. Sampler defaults go through
   `--override-generation-config`. Reasoning effort goes through
-  `--default-chat-template-kwargs.reasoning_effort` (low or high, the
-  template default max talks too much).
+  `--default-chat-template-kwargs.reasoning_effort` (low or high, the template default max talks too much).
 - Expert parallelism needs the unsliced-K4 expert layout, so only the
   4bpw launcher passes `--enable-expert-parallel`.
 - Keep cp/dcp KV interleave sizes equal (4).
@@ -169,15 +229,15 @@ summary) is written once per page no matter how small the page is
 often:
 
 - At page size 512 the cost was 9x per token and the memory pool fell
-  to 797,900 tokens (boot #7d).
-- At page size 4608 the pool holds 1,583,786 tokens (boot #12).
+  to 797,900 tokens (page-splitting experiment).
+- At page size 4608 the pool holds 1,583,786 tokens (measured serving config).
 
 MTP does not need the split: its draft is one shared head
 with almost no KV of its own.
 
-The draft attention must advertise `supports_dcp_replicated`. Only
-`FLASH_ATTN` does at this base commit (`TRITON_ATTN` fails, boot #7).
-Prefix caching stays on.
+The draft attention must advertise `supports_dcp_replicated`, a
+property only `FLASH_ATTN` has at this base commit (`TRITON_ATTN`
+fails), while prefix caching stays on.
 
 ## When the base image updates
 
@@ -188,8 +248,12 @@ podman pull <new-tag>
 # a failing git apply --check means re-anchor the patches. Never force it.
 ```
 
-The tag follows `<stack-name>:<revision>`. Keep the Dockerfile ARG, the
-podman tag, the script IMAGE lines in sync on every revision bump.
+The tag follows `<stack-name>:<revision>`. On every revision bump
+keep these three in sync:
+- the Dockerfile `ARG`
+- the podman tag
+- the script `IMAGE` lines
+
 The Dockerfile stamps the revision into the 0107 log marker and asserts
 the token is fully consumed.
 

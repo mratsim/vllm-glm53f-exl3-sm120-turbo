@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..1a8e481
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/exl3.py
-@@ -0,0 +1,5230 @@
+@@ -0,0 +1,5309 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +# Modified in 2026 to port Brandon Music's v84 adapter to LIL Jovian.
@@ -76,7 +76,7 @@ index 0000000..1a8e481
 +    resolve_encoder_identity,
 +    resolve_model_identity,
 +)
-+from vllm.model_executor.layers.quantization.online.fp8 import _Fp8OnlineLinearBase
++from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
 +from vllm.model_executor.layers.quantization.online.mxfp8 import (
 +    Mxfp8OnlineLinearMethod,
 +)
@@ -97,6 +97,11 @@ index 0000000..1a8e481
 +_SHARED_EXPERT_PROJECTIONS = frozenset(
 +    {"gate_proj", "up_proj", "gate_up_proj", "down_proj"}
 +)
++
++# 0101: every log line this patch adds carries the patchset revision tag so
++# boot lines stay attributable to this patchset. 0107 stamps the same token
++# into its path-audit helper.
++_REVISION_TAG = "[mratsim's sm120-turbo VLLM_PATCHES_REVISION]"
 +
 +
 +def is_shared_expert_projection(prefix: str) -> bool:
@@ -287,8 +292,9 @@ index 0000000..1a8e481
 +        # reproducible checkpoint/encoder defect. The cache layer has already
 +        # rejected and removed the invalid payload.
 +        logger.warning(
-+            "Online EXL3 K%d produced non-finite data for %s on TP rank %d; "
++            "%s Online EXL3 K%d produced non-finite data for %s on TP rank %d; "
 +            "retrying the deterministic encode once",
++            _REVISION_TAG,
 +            cache_key.bits,
 +            cache_key.prefix,
 +            cache_key.tp_rank,
@@ -481,6 +487,11 @@ index 0000000..1a8e481
 +            "Rank-sliced EXL3 requires the BTX Trellis preparation contract "
 +            "in b12x.moe.fused_moe. Install a matching B12X build."
 +        ) from exc
++    # Entry points on this package resolve lazily (PEP 562 __getattr__)
++    # and reading one loads the api module, whose own _impl import binds
++    # the _impl submodule on the package. The rank-sliced prepare path
++    # reads api._impl directly, so that binding must already exist here.
++    fused_moe.is_supported  # lazy entry point read, see above
 +    _B12X_FUSED_MOE_API = fused_moe
 +    return fused_moe
 +
@@ -526,6 +537,57 @@ index 0000000..1a8e481
 +    )
 +    _B12X_MIXED_TRELLIS_API = api
 +    return api
++
++
++def rewarm_mixed_route_packs() -> int:
++    """Re-materialize route-pack JIT entries after B12X preparation eviction.
++
++    Every B12X preparation job ends with ``evict_unretained(keep)`` where
++    ``keep`` holds only the session plan's own programs, so the raw route-pack
++    launches from runtime construction do not survive to the guarded capture
++    (the r5 freeze hit exactly that window at capture desc 5). vLLM calls
++    this after the last preparation job and kernel warmup, immediately before
++    capture begins, making these launches the final writer of the route-pack
++    JIT cache. The B12X dedup set is cleared first, otherwise every call
++    would be a no-op after the construction-time warmup.
++    """
++    if not _MIXED_TRELLIS_RUNTIMES:
++        return 0
++    module = importlib.import_module(
++        "b12x.moe._shared.kernels.w4a16.mixed_trellis"
++    )
++    warmed = 0
++    runtimes = 0
++    module._ROUTE_PACK_WARMED.clear()
++    # The arena buffers are inference tensors (allocated under InferenceMode
++    # during construction) and B12X's warmup zeroes them in place, which only
++    # InferenceMode permits outside model init (r5 boot 3 rewarm crash).
++    with torch.inference_mode():
++        for runtime in _MIXED_TRELLIS_RUNTIMES.values():
++            warm_route_pack = runtime["mixed_api"].warmup_mixed_trellis_route_pack
++            if warm_route_pack is None:
++                raise RuntimeError(
++                    "the installed B12X build lacks mixed Trellis route-pack "
++                    "warmup; CUDA graph capture would refuse the first "
++                    "uncached specialization"
++                )
++            runtimes += 1
++            for state in (runtime["decode"], runtime["prefill"]):
++                if state is None:
++                    continue
++                warmed += warm_route_pack(
++                    state["launch"],
++                    state["buffers"],
++                    expert_map=runtime["expert_map"],
++                )
++    logger.info(
++        "%s EXL3 mixed Trellis route-pack rewarm (post-eviction): "
++        "runtimes=%d variants=%d",
++        _REVISION_TAG,
++        runtimes,
++        warmed,
++    )
++    return warmed
 +
 +
 +def _load_b12x_trellis_linear() -> Any:
@@ -799,8 +861,9 @@ index 0000000..1a8e481
 +        entry = make_buffers(worst, device=device, sms=sms)
 +        _MIXED_TRELLIS_BUFFERS[key] = entry
 +        logger.info(
-+            "R7 fused MoE scratch arena (worst-case sized): capacity=%d "
++            "%s R7 fused MoE scratch arena (worst-case sized): capacity=%d "
 +            "block_m=%d topk=%d max_m_blocks=%d",
++            _REVISION_TAG,
 +            int(capacity),
 +            int(block_size_m),
 +            int(topk),
@@ -1307,8 +1370,9 @@ index 0000000..1a8e481
 +        self.rank_sliced_rotation_layout = _PER_EXPERT_ROTATION_LAYOUT
 +        self.rank_sliced_k_values = None
 +        logger.info_once(
-+            "GLM-5.3 routed-only EXL3: streaming unsliced K4 experts into "
-+            "TP2 B12X slabs for main layers 3..44 and MTP layer 45"
++            "%s GLM-5.3 routed-only EXL3: streaming unsliced K4 experts into "
++            "TP2 B12X slabs for main layers 3..44 and MTP layer 45",
++            _REVISION_TAG,
 +        )
 +
 +    def _configure_online_cache_identity(
@@ -1538,8 +1602,9 @@ index 0000000..1a8e481
 +                changed = True
 +        if changed:
 +            logger.warning_once(
-+                "EXL3 metadata contains an independently quantized lm_head; "
-+                "overriding tie_word_embeddings so vLLM instantiates it."
++                "%s EXL3 metadata contains an independently quantized lm_head; "
++                "overriding tie_word_embeddings so vLLM instantiates it.",
++                _REVISION_TAG,
 +            )
 +
 +    def _require_enforce_eager(self) -> None:
@@ -1651,12 +1716,17 @@ index 0000000..1a8e481
 +            assert self._online_model_identity is not None
 +            assert self._online_encoder_identity is not None
 +            logger.warning_once(
-+                "EXL3 BF16 online Trellis: encoding eligible non-EXL3 "
++                "%s EXL3 BF16 online Trellis: encoding eligible non-EXL3 "
 +                "linear weights at K=%d; 128-unaligned matrices retain the "
 +                "configured MXFP8 path.",
++                _REVISION_TAG,
 +                bits,
 +            )
-+            logger.debug("EXL3 BF16 online Trellis overlay applied to %s", prefix)
++            logger.debug(
++                "%s EXL3 BF16 online Trellis overlay applied to %s",
++                _REVISION_TAG,
++                prefix,
++            )
 +            return Exl3OnlineLinearMethod(
 +                bits=bits,
 +                prefix=prefix,
@@ -1665,11 +1735,14 @@ index 0000000..1a8e481
 +            )
 +
 +        logger.info_once(
-+            "EXL3 BF16 online overlay: quantizing non-EXL3 %s projections "
++            "%s EXL3 BF16 online overlay: quantizing non-EXL3 %s projections "
 +            "to MXFP8 at load time.",
++            _REVISION_TAG,
 +            "shared-expert" if shared_expert else "dense-linear",
 +        )
-+        logger.debug("EXL3 BF16 MXFP8 overlay applied to %s", prefix)
++        logger.debug(
++            "%s EXL3 BF16 MXFP8 overlay applied to %s", _REVISION_TAG, prefix
++        )
 +        return Mxfp8OnlineLinearMethod()
 +
 +    def _storage_entry(self, prefix: str) -> dict[str, Any] | None:
@@ -1893,7 +1966,7 @@ index 0000000..1a8e481
 +    param.load_exl3_weight(loaded_weight, loaded_shard_id)
 +
 +
-+class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
++class Exl3OnlineLinearMethod(OnlineLinearBase):
 +    """Encode eligible BF16 linear shards to cached dense EXL3 weights."""
 +
 +    def __init__(
@@ -1937,8 +2010,9 @@ index 0000000..1a8e481
 +                **extra_weight_attrs,
 +            )
 +            logger.info_once(
-+                "EXL3 online Trellis retains MXFP8 for 128-unaligned shards "
++                "%s EXL3 online Trellis retains MXFP8 for 128-unaligned shards "
 +                "(example %s: K=%d, N=%d).",
++                _REVISION_TAG,
 +                self.prefix,
 +                input_size_per_partition,
 +                output_size_per_partition,
@@ -2076,7 +2150,8 @@ index 0000000..1a8e481
 +        layer._already_called_process_weights_after_loading = True
 +        self._warm_decode_shapes(layer)
 +        logger.info(
-+            "Online EXL3 K%d %s %s%s",
++            "%s Online EXL3 K%d %s %s%s",
++            _REVISION_TAG,
 +            self.bits,
 +            "cache hit for" if result.hit else "encoded",
 +            self.prefix,
@@ -3381,7 +3456,8 @@ index 0000000..1a8e481
 +                param.exl3_tensors.clear()
 +                param.exl3_backing = None
 +        logger.info(
-+            "EXL3 mixed Trellis %s: tiers=%s",
++            "%s EXL3 mixed Trellis %s: tiers=%s",
++            _REVISION_TAG,
 +            layer.layer_name,
 +            tuple((bits, len(ids)) for bits, ids in zip(tiers, tier_ids, strict=True)),
 +        )
@@ -3463,7 +3539,11 @@ index 0000000..1a8e481
 +            )
 +        else:
 +            tile_config = self._trellis_tile_config(hidden_size, intermediate_size)
-+        weight_plan = api.plan_weights(
++        # The karmic B12X deleted the _vllm_compat plan_weights overload
++        # that accepted the quant_modes form. The canonical planner
++        # lives on the same package's _impl submodule, one b12x entry
++        # point kept, uniform rate granularity stays the default.
++        weight_plan = api._impl.plan_b12x_fp4_moe_weights(
 +            quant_modes="w4a16",
 +            source_format="btx",
 +            activation=layer.activation.value,
@@ -3475,7 +3555,6 @@ index 0000000..1a8e481
 +            trellis_bits=bits,
 +            trellis_tile_config=tile_config,
 +            trellis_codebook="mcg",
-+            trellis_rate_structure="uniform",
 +        )
 +        native_weights = native_api.prepare_weights(
 +            w13=w13,
@@ -3540,8 +3619,9 @@ index 0000000..1a8e481
 +        if getattr(layer, "exl3_shared_h_rotations", False):
 +            saved_bytes = (num_experts - 1) * 3 * hidden_size * 2
 +            logger.info_once(
-+                "EXL3 shared-H rotation layout active; saving %.2f MiB per "
++                "%s EXL3 shared-H rotation layout active; saving %.2f MiB per "
 +                "routed-expert layer and TP rank",
++                _REVISION_TAG,
 +                saved_bytes / (1024 * 1024),
 +            )
 +
@@ -3602,9 +3682,10 @@ index 0000000..1a8e481
 +            }
 +            mixed["runtime_policy"] = policy
 +            logger.info_once(
-+                "EXL3 mixed Trellis prefill block policy: selected=%d "
++                "%s EXL3 mixed Trellis prefill block policy: selected=%d "
 +                "configured=%d explicit=%s shape=%dx%d tiers=%s topk=%d "
 +                "sm=%d tile=%s",
++                _REVISION_TAG,
 +                prefill_block_m,
 +                configured_block_m,
 +                explicit_block_m,
@@ -3801,17 +3882,56 @@ index 0000000..1a8e481
 +            "max_decode_m": max_decode_m,
 +            "max_batched_tokens": max_batched_tokens,
 +            "prefill_capacity": prefill_capacity,
++            # Kept for the post-eviction route-pack rewarm, which must pass
++            # the same map tensor the binding serves.
++            "expert_map": mixed["global_to_combined"],
 +        }
 +        _MIXED_TRELLIS_RUNTIMES[key] = runtime
 +        bind_layer_states(runtime)
 +        mixed["runtime"] = runtime
++        # Route packing keeps one Triton specialization per power-of-two
++        # token bucket, and the B12X preparation session refuses to resolve
++        # new kernels under CUDA graph capture. Materialize every bucket now,
++        # while this runtime is still being planned in the eager profile pass
++        # (construction above refuses to run under capture), so the compiled
++        # modules are ready before KV sizing reads the device footprint. B12X
++        # deduplicates per (device, dtype, bucket, topk, experts, block), so
++        # layers sharing the geometry are no-ops. The map must be the same
++        # tensor the binding serves (mixed["global_to_combined"]), or the
++        # captured key would differ from the warmed one. B12X preparation
++        # jobs later evict these raw entries (evict_unretained keeps only
++        # session-plan programs), so rewarm_mixed_route_packs re-runs this
++        # warmup right before the guarded capture.
++        warm_route_pack = mixed_api.warmup_mixed_trellis_route_pack
++        if warm_route_pack is None:
++            raise RuntimeError(
++                "the installed B12X build lacks mixed Trellis route-pack "
++                "warmup; CUDA graph capture would refuse the first "
++                "uncached specialization"
++            )
++        for state in (decode, prefill):
++            if state is None:
++                continue
++            warmed = warm_route_pack(
++                state["launch"],
++                state["buffers"],
++                expert_map=mixed["global_to_combined"],
++            )
++            logger.info(
++                "%s EXL3 mixed Trellis route-pack warmup: capacity=%d "
++                "variants=%d",
++                _REVISION_TAG,
++                int(state["capacity"]),
++                int(warmed),
++            )
 +        decode_bytes = _unique_tensor_storage_bytes(decode["buffers"])
 +        prefill_bytes = (
 +            0 if prefill is None else _unique_tensor_storage_bytes(prefill["buffers"])
 +        )
 +        logger.info_once(
-+            "EXL3 mixed Trellis runtime planned: tiers=%s one-grid decode=%d "
++            "%s EXL3 mixed Trellis runtime planned: tiers=%s one-grid decode=%d "
 +            "one-grid prefill=%d/%d block_m=%d buffers=%.1f+%.1f MiB",
++            _REVISION_TAG,
 +            tier_signature,
 +            max_decode_m,
 +            prefill_capacity,
@@ -4163,7 +4283,7 @@ index 0000000..1a8e481
 +            # Projection-tight w13: exactly gate_count + up_count planes, no
 +            # padded (2, max) stack. Safe because the kernel is told the gate
 +            # count explicitly through the mixed Trellis binding, so its
-+            # cute.size(w13)//2 up-block base lands at gate_count*stride rather
++            # cute.size(w13)//2 up-block base is at gate_count*stride rather
 +            # than being inferred from a padded extent. Padding instead costs
 +            # ~1 extra plane per tier per layer, measured at -1.81 GiB of KV
 +            # headroom at max_model_len 262144 on 4x96 GB.
@@ -4277,7 +4397,7 @@ index 0000000..1a8e481
 +                # of it that is discarded here, so it gets a shared never-read
 +                # ballast; the served w13 is the tight [gate|up] buffer bound
 +                # below. The kernel sizes its w13 descriptor by gate_count
-+                # through the mixed Trellis binding, so cute.size//2 lands the
++                # through the mixed Trellis binding, so cute.size//2 places the
 +                # up-block base at gate_count*stride over that tight buffer.
 +                fc1_prepared = call(slots, _r7_w13_ballast(slots, w13), fc1_w2)
 +                _tight_view = w13.view(torch.int32).reshape(
@@ -4397,7 +4517,8 @@ index 0000000..1a8e481
 +            )
 +        free_b, total_b = torch.cuda.mem_get_info(device)
 +        logger.info(
-+            "R7 fused mem %s: free=%.2fGiB alloc=%.2fGiB reserved=%.2fGiB",
++            "%s R7 fused mem %s: free=%.2fGiB alloc=%.2fGiB reserved=%.2fGiB",
++            _REVISION_TAG,
 +            layer.layer_name,
 +            free_b / 2**30,
 +            torch.cuda.memory_allocated(device) / 2**30,
@@ -4410,7 +4531,12 @@ index 0000000..1a8e481
 +            f"{sum(1 for value in tiers['down'] if value == tier_id)} down)"
 +            for tier_id, bits in enumerate(tier_bits)
 +        )
-+        logger.info("R7 fused B12X MoE %s: %s", layer.layer_name, tier_summary)
++        logger.info(
++            "%s R7 fused B12X MoE %s: %s",
++            _REVISION_TAG,
++            layer.layer_name,
++            tier_summary,
++        )
 +        return True
 +
 +    def _r7_graph_runtime(
@@ -4524,8 +4650,9 @@ index 0000000..1a8e481
 +            if isinstance(value, torch.Tensor)
 +        ) / (1 << 20)
 +        logger.info_once(
-+            "R7 EXL3 CUDA-graph runtime planned: capacity=%d route_block=%d "
++            "%s R7 EXL3 CUDA-graph runtime planned: capacity=%d route_block=%d "
 +            "concurrency=%d topk=%d experts=%d arena=%.1fMiB a1_min_rows=%d",
++            _REVISION_TAG,
 +            capacity,
 +            route_block,
 +            concurrency,
@@ -4855,8 +4982,9 @@ index 0000000..1a8e481
 +            else prefill_scratch.numel() * prefill_scratch.element_size() / (1 << 20)
 +        )
 +        logger.info_once(
-+            "EXL3 %s runtime planned: Trellis m=%d..%d block_m=%d, "
++            "%s EXL3 %s runtime planned: Trellis m=%d..%d block_m=%d, "
 +            "prefill %s scheduler_capacity=%d chunk=%d topk=%d",
++            _REVISION_TAG,
 +            "full-expert EP" if getattr(layer, "exl3_use_ep", False) else "TP-sliced",
 +            min_trellis_m,
 +            max_trellis_m,
@@ -5180,66 +5308,17 @@ index 0000000..1a8e481
 +        return output[..., :logical_n]
 +
 +
-+def warmup_exl3_mixed_trellis_route_pack(model: torch.nn.Module) -> int:
-+    """Materialize mixed-Trellis route-pack modules before KV sizing.
-+
-+    The first profile pass creates every layer's immutable mixed-Trellis
-+    runtime. Route packing itself has power-of-two capacity specializations,
-+    however, so profiling only the maximum batch leaves smaller decode,
-+    speculative, and final-prefill-chunk modules lazy. Delegate enumeration to
-+    B12X while those persistent CUDA allocations can still be measured by the
-+    worker's second profile pass.
-+    """
-+    warmed = 0
-+    seen_layers: set[int] = set()
-+    for module in model.modules():
-+        routed_experts = getattr(module, "routed_experts", module)
-+        mixed = getattr(routed_experts, "exl3_mixed_trellis", None)
-+        if not isinstance(mixed, dict) or id(routed_experts) in seen_layers:
-+            continue
-+        seen_layers.add(id(routed_experts))
-+
-+        runtime = mixed.get("runtime")
-+        if runtime is None:
-+            layer_name = getattr(routed_experts, "layer_name", "<unknown>")
-+            raise RuntimeError(
-+                "mixed-bitrate EXL3 route-pack warmup found no runtime for "
-+                f"{layer_name}; the eager profile pass must plan the runtime "
-+                "before kernel warmup"
-+            )
-+        api = runtime["mixed_api"]
-+        warmup = getattr(api, "warmup_mixed_trellis_route_pack", None)
-+        if not callable(warmup):
-+            raise RuntimeError(
-+                "mixed-bitrate EXL3 route-pack warmup requires a matching B12X build"
-+            )
-+
-+        for state_name in ("decode", "prefill"):
-+            state = runtime.get(state_name)
-+            if state is None:
-+                continue
-+            warmed += int(
-+                warmup(
-+                    state["launch"],
-+                    state["buffers"],
-+                    expert_map=mixed["global_to_combined"],
-+                )
-+            )
-+    return warmed
-+
-+
 +__all__ = [
 +    "Exl3Config",
 +    "Exl3LinearMethod",
 +    "Exl3MoEMethod",
-+    "warmup_exl3_mixed_trellis_route_pack",
 +]
 diff --git a/vllm/model_executor/layers/quantization/exl3_online_cache.py b/vllm/model_executor/layers/quantization/exl3_online_cache.py
 new file mode 100644
 index 0000000..335b04a
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/exl3_online_cache.py
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,393 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -5575,7 +5654,12 @@ index 0000000..335b04a
 +        try:
 +            return _to_device(_load(path, key), device)
 +        except Exception as exc:  # noqa: BLE001 - invalid caches are regenerated
-+            logger.warning("Ignoring invalid online EXL3 cache %s: %s", path, exc)
++            logger.warning(
++                "%s Ignoring invalid online EXL3 cache %s: %s",
++                _REVISION_TAG,
++                path,
++                exc,
++            )
 +
 +    if mode == "readonly":
 +        return _quantize(key, quantize, path=None)
@@ -5589,7 +5673,10 @@ index 0000000..335b04a
 +                    return _to_device(_load(path, key), device)
 +                except Exception as exc:  # noqa: BLE001 - invalid caches are replaced
 +                    logger.warning(
-+                        "Replacing invalid online EXL3 cache %s: %s", path, exc
++                        "%s Replacing invalid online EXL3 cache %s: %s",
++                        _REVISION_TAG,
++                        path,
++                        exc,
 +                    )
 +                    path.unlink(missing_ok=True)
 +            result = _quantize(key, quantize, path=path)
@@ -5597,8 +5684,9 @@ index 0000000..335b04a
 +                _save(path, key, result)
 +            except Exception as exc:  # noqa: BLE001 - cache publication is optional
 +                logger.warning(
-+                    "Unable to publish online EXL3 cache %s; using the encoded "
++                    "%s Unable to publish online EXL3 cache %s; using the encoded "
 +                    "weights for this process: %s",
++                    _REVISION_TAG,
 +                    path,
 +                    exc,
 +                )
@@ -5608,8 +5696,9 @@ index 0000000..335b04a
 +            return result
 +    except filelock.Timeout as exc:
 +        logger.warning(
-+            "Online EXL3 cache lock remained held for %.0f seconds at %s; "
++            "%s Online EXL3 cache lock remained held for %.0f seconds at %s; "
 +            "encoding without cache: %s",
++            _REVISION_TAG,
 +            _CACHE_LOCK_TIMEOUT_SECONDS,
 +            path,
 +            exc,
@@ -5617,7 +5706,8 @@ index 0000000..335b04a
 +        return _quantize(key, quantize, path=None)
 +    except OSError as exc:
 +        logger.warning(
-+            "Online EXL3 cache is unavailable at %s; encoding without cache: %s",
++            "%s Online EXL3 cache is unavailable at %s; encoding without cache: %s",
++            _REVISION_TAG,
 +            path,
 +            exc,
 +        )

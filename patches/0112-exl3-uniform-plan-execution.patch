@@ -1,0 +1,512 @@
+diff --git a/vllm/model_executor/layers/quantization/exl3.py b/vllm/model_executor/layers/quantization/exl3.py
+index f686b58a87..a376669f67 100644
+--- a/vllm/model_executor/layers/quantization/exl3.py
++++ b/vllm/model_executor/layers/quantization/exl3.py
+@@ -130,6 +130,7 @@ _MUL1_SENTINEL = 0x83DCD12D
+ _HADAMARD_BLOCK = 128
+ _EXL3_EXT: Any | None = None
+ _B12X_FUSED_MOE_API: Any | None = None
++_B12X_PREPARATION_API: Any | None = None
+ _B12X_MIXED_TRELLIS_API: Any | None = None
+ _B12X_TRELLIS_LINEAR_API: Any | None = None
+ _EXL3_ONLINE_QUANTIZER: Any | None = None
+@@ -142,6 +143,10 @@ _B12X_TRELLIS_WARMED_DEVICES: set[int] = set()
+ # layers instead of allocating inside CUDA graph capture.
+ _B12X_TRELLIS_C_TMP_CAP = 192 * 4 * 64 * 256
+ _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
++# Uniform rank-sliced execution plans share one scratch arena per launch
++# geometry, the same way the mixed-bitrate buffers below are shared; layers
++# execute sequentially, so a geometry-keyed arena is safe under capture.
++_UNIFORM_EXECUTION_SCRATCH: dict[tuple[Any, ...], tuple[torch.Tensor, ...]] = {}
+ _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
+ # Mixed-bitrate scratch buffers are keyed by launch geometry and shared across
+ # layers owned by the same model or draft runner.
+@@ -510,6 +515,29 @@ def _load_b12x_fused_moe() -> Any:
+     return fused_moe
+ 
+ 
++def _load_b12x_preparation() -> Any:
++    """Resolve the b12x session-preparation API lazily.
++
++    vLLM's own B12xExperts imports FrozenMapping from b12x.preparation
++    (fused_moe/b12x.py), not from b12x.moe.fused_moe - boot 6 proved the
++    plan module has no such attribute (b12x _lib/meta.py PEP 562 raises).
++    """
++
++    global _B12X_PREPARATION_API
++    if _B12X_PREPARATION_API is not None:
++        return _B12X_PREPARATION_API
++    try:
++        from b12x import preparation
++    except Exception as exc:
++        raise RuntimeError(
++            f"{_REVISION_TAG} Rank-sliced EXL3 session planning requires "
++            "b12x.preparation (FrozenMapping lives there, matching vllm's "
++            "own B12xExperts import). Install a matching B12X build."
++        ) from exc
++    _B12X_PREPARATION_API = preparation
++    return preparation
++
++
+ def _load_b12x_mixed_trellis() -> Any:
+     """Resolve the one-grid mixed-bitrate Trellis API lazily."""
+ 
+@@ -3543,6 +3571,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+             )
+             self._prepare_mixed_rank_sliced_weights(layer)
+             return
++        if getattr(layer, "exl3_use_ep", False):
++            raise RuntimeError(
++                f"{_REVISION_TAG} karmic b12x removed the EP rank-sliced "
++                "runtime surface (api.Caps/api.plan/bind/run and expert "
++                "maps are gone); uniform-K4 EXL3 must run TP-sharded - "
++                "remove --enable-expert-parallel from the launcher"
++            )
+         api = _load_b12x_fused_moe()
+         native_api = _load_b12x_mixed_trellis()
+         num_experts = int(layer.local_num_experts)
+@@ -3678,6 +3713,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+             f"layer={layer.layer_name} bits={bits} experts={num_experts} "
+             f"tile={tile_config}",
+         )
++        # Register this layer with the b12x preparation session: the driver's
++        # weights-stage walk calls get_b12x_preparation_units below, whose
++        # plan_execution + plan.request put the layer's compiled programs in
++        # the session retain set (eviction-proof by construction).
++        from vllm.utils.b12x import set_b12x_preparation_provider
++
++        set_b12x_preparation_provider(layer, self)
+ 
+         slabs = (
+             w13[0],
+@@ -4838,6 +4880,206 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+             output[start:stop].copy_(out32)
+         return output
+ 
++    def get_b12x_preparation_units(
++        self,
++        layer: RoutedExperts,
++        workload: Any,
++    ) -> tuple[Any, ...]:
++        """Describe the uniform rank-sliced runtime to the b12x session.
++
++        Called by the driver's weights-stage walk through the provider the
++        layer got in _prepare_rank_sliced_weights. The plan_execution request
++        registered here makes the session prepare (autotune, JIT compile,
++        bind-check) and RETAIN every program the serving bind will use, so
++        the mid-capture evictions that froze the mixed path's raw warmup
++        cannot recur on this path.
++        """
++        from vllm.utils.b12x import (
++            B12xPreparationUnit,
++            PreparationResourceUnavailableError,
++        )
++
++        if workload.stage != "weights":
++            return ()
++        if getattr(layer, "exl3_mixed_bitrate", False):
++            # The mixed path warms through the construction warmup plus the
++            # post-eviction rewarm hook; it owns no session unit here.
++            return ()
++        prepared = getattr(layer, "exl3_trellis_weights", None)
++        if prepared is None:
++            raise PreparationResourceUnavailableError(
++                f"{_REVISION_TAG} EXL3 rank-sliced layer {layer.layer_name!r} "
++                "reached b12x weight preparation without adopted Trellis "
++                "weights"
++            )
++        api = _load_b12x_fused_moe()
++        topk = int(getattr(layer, "top_k", 0) or 8)
++        counts = tuple(int(count) for count in workload.token_counts)
++        existing = getattr(layer, "exl3_execution_plan", None)
++        if (
++            existing is not None
++            and getattr(layer, "exl3_execution_counts", None) == counts
++        ):
++            plan = existing
++        else:
++            # b12x's execution planner gates on the canonical PreparedExperts
++            # wrapper (isinstance in _preparation.plan), not on the raw
++            # B12XFP4ExpertWeights owner our adapter builds. Wrap the adopted
++            # owner: WeightPlan._impl IS the adopted MoEWeightPreparationPlan
++            # so the wrapper's equality check holds, and every content field
++            # the planner reads (quant_modes, source_format, layouts,
++            # geometry, trellis descriptor) comes from that same plan.
++            # source stays None: only canonical prepare_weights reads it and
++            # the adapter bypasses that path (weights arrive TRELLIS-native
++            # via adoption); fabricating scale/transform declarations would
++            # state contracts nothing reads.
++            plan_impl = prepared.plan
++            experts = api.PreparedExperts(
++                plan=api.WeightPlan(
++                    source=None,
++                    activation=api.ActivationSpec(
++                        mode=api.ActivationMode.A16,
++                        nonlinearity=str(plan_impl.activation),
++                        io_dtype=getattr(
++                            torch,
++                            str(plan_impl.io_dtype).removeprefix("torch."),
++                        ),
++                    ),
++                    geometry=api.MoEGeometry(
++                        num_experts=int(plan_impl.num_experts),
++                        hidden_size=int(plan_impl.hidden_size),
++                        intermediate_size=int(plan_impl.intermediate_size),
++                    ),
++                    prepared_format=api.PreparedWeightFormat(
++                        weights=api.WeightEncoding.TRELLIS,
++                        scales=api.ScaleEncoding.TRELLIS_SCALES,
++                        packing=api.WeightPacking.TRELLIS_NATIVE,
++                        available_packings=frozenset(
++                            {api.WeightPacking.TRELLIS_NATIVE}
++                        ),
++                    ),
++                    _impl=plan_impl,
++                ),
++                _impl=prepared,
++            )
++            layer.exl3_prepared_experts = experts
++            plan = api.plan_execution(
++                experts=experts,
++                capacity=api.ExecutionCapacity(
++                    max_tokens=int(workload.max_tokens),
++                    top_k=topk,
++                    warmup_token_counts=counts,
++                    # vLLM supplies final top-k IDs/weights to bind(); the
++                    # router workspace is unused and expert maps are gone
++                    # from this b12x revision.
++                    route_num_experts=0,
++                ),
++                routing=api.RoutingSpec(apply_router_weight_on_input=False),
++                invocation=_load_b12x_preparation().FrozenMapping(
++                    {"tuning_route_pattern": "cyclic_disjoint_topk"}
++                ),
++            )
++            layer.exl3_execution_plan = plan
++            layer.exl3_execution_counts = counts
++        # Session trial calls bind through the canonical wrapper (its identity
++        # with the plan declaration is enforced at bind); the raw adopted
++        # owner never reaches bind.
++        experts = getattr(layer, "exl3_prepared_experts", None)
++        if experts is None:
++            raise RuntimeError(
++                f"{_REVISION_TAG} EXL3 rank-sliced layer {layer.layer_name!r} "
++                "lost its canonical PreparedExperts wrapper"
++            )
++        scratch_key = (
++            int(layer.exl3_hidden_size),
++            int(layer.exl3_intermediate_size_per_partition),
++            int(layer.local_num_experts),
++            topk,
++            int(workload.max_tokens),
++            prepared.w1_fp4.device,
++        )
++        scratch = _UNIFORM_EXECUTION_SCRATCH.get(scratch_key)
++        if scratch is None:
++            scratch = tuple(
++                torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
++                for spec in plan.scratch_specs()
++            )
++            _UNIFORM_EXECUTION_SCRATCH[scratch_key] = scratch
++        layer.exl3_execution_scratch = scratch
++        from vllm.model_executor.layers.fused_moe.b12x import (
++            _prepared_moe_call_factory,
++        )
++
++        output_dtype = workload.output_dtype
++        if hasattr(plan, "token_counts"):
++            plan_counts = tuple(int(count) for count in plan.token_counts)
++            calls = {
++                count: _prepared_moe_call_factory(
++                    tokens=count,
++                    topk=topk,
++                    prepared=experts,
++                    output_dtype=output_dtype,
++                )
++                for count in plan_counts
++            }
++            benchmark_calls = {
++                count: _prepared_moe_call_factory(
++                    tokens=count,
++                    topk=topk,
++                    prepared=experts,
++                    output_dtype=output_dtype,
++                )
++                for count in plan_counts
++            }
++            request = plan.request(
++                name=f"exl3_rank_sliced:{layer.layer_name}",
++                prepare_calls=calls,
++                benchmark_calls=benchmark_calls,
++            )
++        else:
++            request = plan.request(
++                name=f"exl3_rank_sliced:{layer.layer_name}",
++                prepare_call=_prepared_moe_call_factory(
++                    tokens=counts[0],
++                    topk=topk,
++                    prepared=experts,
++                    output_dtype=output_dtype,
++                ),
++                benchmark_call=_prepared_moe_call_factory(
++                    tokens=counts[0],
++                    topk=topk,
++                    prepared=experts,
++                    output_dtype=output_dtype,
++                ),
++            )
++        bits_values = tuple(getattr(layer, "exl3_layer_bitrates", ()) or (0,))
++        key = (
++            "exl3-w4a16",
++            int(bits_values[0]),
++            int(layer.exl3_hidden_size),
++            int(layer.exl3_intermediate_size_per_partition),
++            int(layer.local_num_experts),
++            topk,
++            counts,
++        )
++        logger.info_once(
++            "%s EXL3 rank-sliced execution plan registered: layer=%s "
++            "counts=%d capacity=%d topk=%d",
++            _REVISION_TAG,
++            layer.layer_name,
++            len(counts),
++            int(workload.max_tokens),
++            topk,
++        )
++        return (
++            B12xPreparationUnit(
++                name="EXL3W4A16",
++                key=key,
++                requests=(request,),
++                stage="weights",
++            ),
++        )
++
+     def _rank_sliced_runtime(
+         self,
+         layer: RoutedExperts,
+@@ -4901,9 +5143,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+             )
+         device_index = x.device.index
+         key = (
+-            # Owning model scope first: the cached runtime holds mutable scratch,
+-            # so a target layer and a same-shape rank-sliced MTP draft layer must
+-            # not share an entry (see _runtime_scope_id).
++            # Owning model scope first: the cached runtime holds mutable
++            # parity staging, so a target layer and a same-shape rank-sliced
++            # MTP draft layer must not share an entry (see _runtime_scope_id).
+             _runtime_owner_token(self.quant_config, layer),
+             device_index,
+             x.dtype,
+@@ -4931,46 +5173,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+             )
+ 
+         api = _load_b12x_fused_moe()
+-
+-        def _plan_with_scratch(plan_max_tokens: int, plan_block_m: int):
+-            route_num_experts = (
+-                int(layer.global_num_experts)
+-                if getattr(layer, "exl3_use_ep", False)
+-                else 0
+-            )
+-            caps = api.Caps(
+-                max_tokens=plan_max_tokens,
+-                num_topk=topk,
+-                # vLLM supplies final top-k IDs/weights to bind(); the fused-MoE
+-                # router workspace is unused. A zero route-workspace request
+-                # still lets the W4A16 core derive route_E from weight_E.
+-                route_num_experts=route_num_experts,
+-                device=x.device,
+-                weight_plan=layer.exl3_trellis_weights.plan,
+-                quant_mode="w4a16",
+-                w4a16_block_size_m=plan_block_m,
+-            )
+-            plan = api.plan(caps)
+-            scratch_spec = plan.scratch_specs()[0]
+-            scratch = torch.empty(
+-                scratch_spec.shape,
+-                dtype=scratch_spec.dtype,
+-                device=scratch_spec.device,
+-            )
+-            return plan, scratch
+-
+-        trellis_plan, trellis_scratch = _plan_with_scratch(max_trellis_m, block_m)
+-        # Prefill batches (m > max_trellis_m) run through a second planned
+-        # Trellis capacity instead of the eager ExLlamaV3 parity path. The
+-        # large block keeps expert tiles streamed once per block of routed
+-        # rows rather than once per 8-row block.
+-        prefill_plan = None
+-        prefill_scratch = None
+-        if prefill_plan_enabled:
+-            prefill_plan, prefill_scratch = _plan_with_scratch(
+-                prefill_capacity, prefill_block_m
+-            )
+-
++        # The execution plan itself is created by get_b12x_preparation_units
++        # during the b12x weights-stage session pass (the layer registers this
++        # method as its preparation provider in _prepare_rank_sliced_weights).
++        # Only the eager parity staging below is planned here.
+         ext = _load_exl3_ext()
+         required_ext = {
+             "exl3_moe",
+@@ -4989,14 +5195,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
+         num_experts = int(layer.local_num_experts)
+         device = x.device
+-        # With the prefill plan live, the parity path only ever serves
+-        # m < min_trellis_m, so its persistent staging shrinks to one chunk.
++        # With the execution plan owned by the b12x session, the parity path
++        # is only an eager fallback for unplanned states; its persistent
++        # staging shrinks to one chunk.
+         runtime = {
+             "api": api,
+-            "trellis_plan": trellis_plan,
+-            "trellis_scratch": trellis_scratch,
+-            "prefill_plan": prefill_plan,
+-            "prefill_scratch": prefill_scratch,
+             "ext": ext,
+             "min_trellis_m": min_trellis_m,
+             "max_trellis_m": max_trellis_m,
+@@ -5067,26 +5270,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+             ),
+         }
+         _RANK_SLICED_RUNTIMES[key] = runtime
+-        prefill_arena_mib = (
+-            0.0
+-            if prefill_scratch is None
+-            else prefill_scratch.numel() * prefill_scratch.element_size() / (1 << 20)
+-        )
+         logger.info_once(
+-            "%s EXL3 %s runtime planned: Trellis m=%d..%d block_m=%d, "
+-            "prefill %s scheduler_capacity=%d chunk=%d topk=%d",
++            "%s EXL3 rank-sliced parity staging ready: window_env=%d..%d "
++            "chunk=%d topk=%d (execution plans come from the b12x "
++            "weights-stage session)",
+             _REVISION_TAG,
+-            "full-expert EP" if getattr(layer, "exl3_use_ep", False) else "TP-sliced",
+             min_trellis_m,
+             max_trellis_m,
+-            block_m,
+-            (
+-                f"trellis block_m={prefill_block_m} "
+-                f"capacity={prefill_capacity} arena={prefill_arena_mib:.1f}MiB"
+-                if prefill_plan is not None
+-                else "parity"
+-            ),
+-            max_batched_tokens,
+             chunk,
+             topk,
+         )
+@@ -5108,86 +5298,40 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+             )
+         runtime = self._rank_sliced_runtime(layer, x, topk_ids)
+         m = int(x.shape[0])
+-        if runtime["min_trellis_m"] <= m <= runtime["max_trellis_m"]:
+-            expert_map = (
+-                layer.exl3_expert_map if getattr(layer, "exl3_use_ep", False) else None
++        plan = getattr(layer, "exl3_execution_plan", None)
++        if plan is not None:
++            if m > int(runtime["max_batched_tokens"]):
++                raise ValueError(
++                    f"{_REVISION_TAG} EXL3 batch exceeds its planned "
++                    f"capacity: m={m}, capacity={runtime['max_batched_tokens']}"
++                )
++            output = torch.empty(
++                (m, int(layer.exl3_hidden_size)),
++                dtype=x.dtype,
++                device=x.device,
+             )
+             binding = runtime["api"].bind(
+-                runtime["trellis_plan"],
+-                scratch=runtime["trellis_scratch"],
++                plan,
++                scratch=getattr(layer, "exl3_execution_scratch"),
+                 a=x,
+-                experts=layer.exl3_trellis_weights,
++                experts=layer.exl3_prepared_experts,
+                 topk_weights=topk_weights,
+                 topk_ids=topk_ids,
+-                route_expert_map=expert_map,
+-                output_expert_map=expert_map,
++                output=output,
++                input_scales_static=True,
+             )
+-            output = runtime["api"].run(binding=binding)
++            runtime["api"].run(binding=binding)
+             return output.to(x.dtype)
+-
+-        if runtime["prefill_plan"] is not None and m > runtime["max_trellis_m"]:
+-            if m > runtime["max_batched_tokens"]:
+-                raise ValueError(
+-                    "EXL3 batch exceeds its planned capacity: "
+-                    f"m={m}, capacity={runtime['max_batched_tokens']}"
+-                )
+-            prefill_capacity = int(runtime["prefill_capacity"])
+-            if m <= prefill_capacity:
+-                expert_map = (
+-                    layer.exl3_expert_map
+-                    if getattr(layer, "exl3_use_ep", False)
+-                    else None
+-                )
+-                binding = runtime["api"].bind(
+-                    runtime["prefill_plan"],
+-                    scratch=runtime["prefill_scratch"],
+-                    a=x,
+-                    experts=layer.exl3_trellis_weights,
+-                    topk_weights=topk_weights,
+-                    topk_ids=topk_ids,
+-                    route_expert_map=expert_map,
+-                    output_expert_map=expert_map,
+-                )
+-                output = runtime["api"].run(binding=binding)
+-                return output.to(x.dtype)
+-
+-            output = torch.empty_like(x)
+-            expert_map = (
+-                layer.exl3_expert_map if getattr(layer, "exl3_use_ep", False) else None
+-            )
+-            for start in range(0, m, prefill_capacity):
+-                stop = min(start + prefill_capacity, m)
+-                binding = runtime["api"].bind(
+-                    runtime["prefill_plan"],
+-                    scratch=runtime["prefill_scratch"],
+-                    a=x[start:stop],
+-                    experts=layer.exl3_trellis_weights,
+-                    topk_weights=topk_weights[start:stop],
+-                    topk_ids=topk_ids[start:stop],
+-                    route_expert_map=expert_map,
+-                    output_expert_map=expert_map,
+-                )
+-                slice_output = runtime["api"].run(binding=binding)
+-                output[start:stop].copy_(slice_output)
+-            return output
+-
+-        if getattr(layer, "exl3_use_ep", False):
+-            raise RuntimeError(
+-                "EXL3 full-expert EP requires every batch to use the fused "
+-                "Trellis plan; unset VLLM_EXL3_TRELLIS_MIN_M or set it to 1"
+-            )
+         if torch.cuda.is_current_stream_capturing():
+             raise RuntimeError(
+-                "EXL3 eager parity path entered during CUDA graph capture "
+-                f"(m={m}); capture sizes must lie inside the Trellis window "
+-                f"[{runtime['min_trellis_m']}, {runtime['max_trellis_m']}]. "
+-                f"Layer {getattr(layer, 'layer_name', '<unknown>')!r} was "
+-                f"classified as {'draft' if _is_draft_layer(layer) else 'target'}. "
+-                "A rank-sliced draft layer should have had its window widened to "
+-                f"MIN_CAPTURABLE_TRELLIS_M={MIN_CAPTURABLE_TRELLIS_M} "
+-                "automatically; if VLLM_EXL3_TRELLIS_MIN_M is set explicitly, "
+-                f"lower it to {MIN_CAPTURABLE_TRELLIS_M} or unset it."
+-            )
++                "EXL3 rank-sliced execution plan missing during CUDA graph "
++                f"capture (m={m}); the b12x weights-stage session must run "
++                "before capture. Layer "
++                f"{getattr(layer, 'layer_name', '<unknown>')!r} was "
++                f"classified as {'draft' if _is_draft_layer(layer) else 'target'}."
++            )
++        # Eager fallback for unplanned states (the session always plans
++        # before the profile pass on a healthy boot).
+         if m > runtime["parity_rows"]:
+             raise ValueError(
+                 "EXL3 batch exceeds its planned parity capacity: "
