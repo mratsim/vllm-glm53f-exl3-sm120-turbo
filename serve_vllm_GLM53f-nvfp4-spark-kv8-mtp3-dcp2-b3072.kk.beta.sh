@@ -1,7 +1,5 @@
 #!/bin/bash
-# GLM-5.3-Flash NVFP4 Spark (local-inference-lab). 8-bit KV cache,
-# MTP-3, GPUs split (DCP=2). Aligned to the official glm53-spark-tp2
-# preset (lil-docker-builds runtime/presets.yaml + profiles/glm53-flash).
+# GLM-5.3-Flash NVFP4 Spark (local-inference-lab). 8-bit KV cache, MTP-3, GPUs split (DCP=2).
 set -euo pipefail
 
 # ============================================================
@@ -36,30 +34,52 @@ MODEL="${LOCAL_MODELS}"/GLM-5.3-Flash-NVFP4-Spark
 TP_SIZE=2
 DCP_SIZE=2
 GPU_UTIL=0.985
-CONTEXT_SIZE=327680
+CONTEXT_SIZE=-1                      # auto: the model cap (1,048,576) clamped by the KV pool
 MAX_NUM_SEQS=4
 MAX_NUM_BATCHED_TOKENS=3072
-KV_CACHE_MEMORY_BYTES=4190109696   # 3996 MiB per GPU, pinned
-KV_OFFLOADING_SIZE=64             # GiB native host KV tier; empty/0 disables
+KV_CACHE_MEMORY_BYTES=4190109696   # 3996 MiB per GPU, fixed to avoid mis-sizing due to cuda graphs / preflight
 KV_CACHE_DTYPE=fp8
 BLOCK_SIZE=256
 CP_KV_INTERLEAVE=4
 MTP_TOKENS=3
 REASONING_EFFORT=high
 HEALTH_START_PERIOD=600
-# Native offload pins/registers the GPU cache allocations, so PyTorch's
-# remappable VMM segments must be off and the native-L2 keys stable
-# across restarts (the same contract as the DeepSeek launcher).
-ALLOC_CONF="expandable_segments:True,large_segment_size_mb:12"
-VLLM_OFFLOAD=()
-if [[ -n "${KV_OFFLOADING_SIZE}" && "${KV_OFFLOADING_SIZE}" != "0" ]]
+
+# LMCache prefix cache (the official GLM contract, rtx6kpro
+# serve-glm53-flash-cache-complete): a CPU-only sidecar owns the L1 RAM tier
+# and vLLM gathers and scatters through the MP connector in its workers.
+# Retention equals the chunk so recurrent checkpoints stay inside one object.
+LMCACHE_ENABLED=1
+LMCACHE_TRANSFER_MODE=engine_driven
+LMCACHE_L1_GB=64
+LMCACHE_L1_INIT_GB=2
+LMCACHE_L2_ENABLED=0
+LMCACHE_CHUNK_SIZE=4096
+LMCACHE_INSTANCE_ID=glm53-spark-tp2-kv8
+LMCACHE_MP_PORT=5555
+LMCACHE_HTTP_PORT=8085
+LMCACHE_PROM_PORT=9095
+LMCACHE_START_TIMEOUT=120
+
+VLLM_CACHE_ENV=()
+VLLM_CACHE_ARGS=()
+LMCACHE_SERVER=""
+if [[ "${LMCACHE_ENABLED}" == "1" ]]
 then
-    ALLOC_CONF="expandable_segments:False"
-    VLLM_OFFLOAD=(
-        -e PYTHONHASHSEED=0
-        --kv-offloading-size "${KV_OFFLOADING_SIZE}"
-        --kv-offloading-backend native
+    MAX_NUM_BATCHED_TOKENS=${LMCACHE_CHUNK_SIZE}
+    SPLIT_TARGET_BLOCK_SIZE=auto
+    VLLM_CACHE_ENV=(
+        -e LMCACHE_KV_CACHE_DTYPE=fp8_ds_mla
+        -e LMCACHE_VLLM_KV_CACHE_DTYPE=fp8
+        -e LMCACHE_TRANSFER_MODE=${LMCACHE_TRANSFER_MODE}
+        -e LMCACHE_CHUNK_SIZE=${LMCACHE_CHUNK_SIZE}
     )
+    VLLM_CACHE_ARGS=(
+        --kv-transfer-config "{\"kv_connector\":\"LMCacheMPConnector\",\"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\"lmcache.mp.port\":${LMCACHE_MP_PORT},\"lmcache.mp.mp_transfer_mode\":\"${LMCACHE_TRANSFER_MODE}\"}}"
+        --prefix-cache-retention-interval "${LMCACHE_CHUNK_SIZE}"
+        --max-num-scheduled-tokens "${LMCACHE_CHUNK_SIZE}"
+    )
+    LMCACHE_SERVER="env CUDA_VISIBLE_DEVICES= CUDA_MODULE_LOADING=LAZY /opt/venv/bin/lmcache server --instance-id ${LMCACHE_INSTANCE_ID} --host 127.0.0.1 --port ${LMCACHE_MP_PORT} --chunk-size ${LMCACHE_CHUNK_SIZE} --max-workers 8 --max-gpu-workers 8 --max-cpu-workers 16 --hash-algorithm blake3 --supported-transfer-mode ${LMCACHE_TRANSFER_MODE} --separate-object-groups --l1-size-gb ${LMCACHE_L1_GB} --l1-init-size-gb ${LMCACHE_L1_INIT_GB} --eviction-policy LRU --http-host 127.0.0.1 --http-port ${LMCACHE_HTTP_PORT} --prometheus-port ${LMCACHE_PROM_PORT} --no-l1-use-lazy --shm-name lmcache-${LMCACHE_INSTANCE_ID}-${LMCACHE_MP_PORT}"
 fi
 
 # Ready-made graph sizes. Spec decoding on: (K+1) x seqs. Off: 4 x seqs
@@ -99,7 +119,6 @@ VLLM_ENV+=(
     -e HF_HUB_OFFLINE=1
     -e TRANSFORMERS_OFFLINE=1
     -e SAFETENSORS_FAST_GPU=1
-    -e VLLM_USE_V2_MODEL_RUNNER=1
     -e VLLM_ENABLE_PCIE_ALLREDUCE=0
     -e NCCL_P2P_DISABLE=1
     -e NCCL_SOCKET_IFNAME=lo
@@ -110,7 +129,7 @@ VLLM_ENV+=(
     -e NCCL_NET_PLUGIN=none
     -e NCCL_TUNER_PLUGIN=none
     -e CUTE_DSL_ARCH=sm_120a
-    -e PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF}
+    -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,large_segment_size_mb:12
     -e CUBLAS_WORKSPACE_CONFIG=:4096:1
     -e VLLM_GLM53_MTP_DRAFT_HEAD=nvfp4
     -e VLLM_MXFP8_LM_HEAD=0
@@ -119,7 +138,7 @@ VLLM_ENV+=(
     -e VLLM_B12X_MOE_FP4_FORCE_A16=0
     -e VLLM_DISABLED_KERNELS=MarlinFP8ScaledMMLinearKernel
     -e VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS=65536
-    -e VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE=2048
+    -e VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE=${SPLIT_TARGET_BLOCK_SIZE:-2048}
     -e VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE=auto
     -e B12X_MHC_PDL=1
     -e VLLM_GLM53_L2_PREFETCH=1
@@ -165,8 +184,20 @@ VLLM_EXTRA+=(
   printf '  context      %s, kv-pool=%s bytes/gpu, mem-fraction=%s\n' "${CONTEXT_SIZE}" "${KV_CACHE_MEMORY_BYTES}" "${GPU_UTIL}"
   printf '  batching     max-seqs=%s, batched-tokens=%s, graph-cap=%s\n' "${MAX_NUM_SEQS}" "${MAX_NUM_BATCHED_TOKENS}" "${GRAPH_CAP}"
   printf '  speculation  mtp (K=%s, probabilistic)\n' "${MTP_TOKENS}"
-  printf '  offloading   %s\n' "$([ -n "${KV_OFFLOADING_SIZE}" ] && [ "${KV_OFFLOADING_SIZE}" != "0" ] && echo "native ${KV_OFFLOADING_SIZE} GiB" || echo off)"
+  printf '  cache        lmcache %s, mode=%s, l1=%s GiB, l2=%s\n' \
+    "$([[ "${LMCACHE_ENABLED}" == 1 ]] && echo on || echo off)" \
+    "${LMCACHE_TRANSFER_MODE}" "${LMCACHE_L1_GB}" "${LMCACHE_L2_ENABLED}"
 } >&2
+
+# The wrapper unsets host-side env overrides, then brings the cache sidecar
+# up first (engine-driven needs its SHM arena before vLLM profiles) and
+# health-checks it before vLLM starts.
+WRAP='unset MAX_NUM_BATCHED_TOKENS MAX_CUDAGRAPH_CAPTURE_SIZE CUDAGRAPH_CAPTURE_SIZES PREFILL_SCHEDULE_INTERVAL FAIRNESS_ENGINE PREFILL_COMPUTE_SHARE VLLM_PCIE_ALLREDUCE_BACKEND VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE MAX_MODEL_LEN'
+if [[ -n "${LMCACHE_SERVER}" ]]
+then
+    WRAP+="; ${LMCACHE_SERVER} & LM_PID=\$!; t=0; until curl -fs --max-time 2 http://127.0.0.1:${LMCACHE_HTTP_PORT}/healthcheck >/dev/null; do kill -0 \$LM_PID 2>/dev/null || exit 1; t=\$((t+1)); [ \$t -ge ${LMCACHE_START_TIMEOUT} ] && exit 1; sleep 1; done"
+fi
+WRAP+='; exec /opt/venv/bin/vllm serve "$@"'
 
 # ============================================================
 # Container
@@ -193,10 +224,9 @@ podman run --replace --detach --restart=always \
     -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor \
     -e B12X_COMPILE_CACHE_DIR=/cache/b12x \
     "${VLLM_ENV[@]}" \
-    "${VLLM_OFFLOAD[@]}" \
+    "${VLLM_CACHE_ENV[@]}" \
     "${IMAGE}" \
-        -lc 'unset MAX_NUM_BATCHED_TOKENS MAX_CUDAGRAPH_CAPTURE_SIZE CUDAGRAPH_CAPTURE_SIZES PREFILL_SCHEDULE_INTERVAL FAIRNESS_ENGINE PREFILL_COMPUTE_SHARE VLLM_PCIE_ALLREDUCE_BACKEND VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE MAX_MODEL_LEN
-exec /opt/venv/bin/vllm serve "$@"' -- \
+        -lc "${WRAP}" -- \
             "${MODEL}" \
             `# Networking` \
             --host 0.0.0.0 \
@@ -210,6 +240,9 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --dtype bfloat16 \
             --kv-cache-dtype "${KV_CACHE_DTYPE}" \
             --block-size "${BLOCK_SIZE}" \
+            # TODO: explore --mamba-ssm-cache-dtype bfloat16
+            # to divide the cache fixed cost by 2 (verify via the
+            # rebalance line's max-request cost before adoption)
             --mamba-cache-mode align \
             --recurrent-checkpoint-policy request_boundaries \
             --enable-prefix-caching \
@@ -243,6 +276,8 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             "${VLLM_BACKEND[@]}" \
             "${VLLM_EXTRA[@]}" \
             "${VLLM_SPEC[@]}" \
+            "${VLLM_CACHE_ARGS[@]}" \
+            "${VLLM_OFFLOAD_ARGS[@]}" \
             `# SAMPLER` \
             --override-generation-config '{"temperature": 1, "top_p": 0.95}' \
             "$@"

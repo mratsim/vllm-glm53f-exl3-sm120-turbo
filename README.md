@@ -37,11 +37,59 @@ names end with the prefill block (pb32 or pb64).
 | `serve_vllm_GLM53f-exl3-35bpw-kv8-mtp3-dcp1-b2048.kk.beta.sh` | satgeze, mixed K3/K4 | MTP-3 | DCP=1 | 2048 | 64 |
 | `serve_vllm_GLM53f-exl3-35bpw-kv8-mtp3-dcp2-b2048.kk.beta.sh` | satgeze, mixed K3/K4 | MTP-3 | DCP=2 | 2048 | 64 |
 
-All eight: b12x backends, served as `GLM-5.3-Flash`, 327,680 context,
-KV cache dtype `fp8_ds_mla`. The b2048 dflash pair and the two MTP
-scripts form a 2x2 grid: two speculation modes times two split sizes,
-and any two cells differ in exactly one thing so comparisons are
-clean. The b4096 dflash pair is the wider-step variant of the grid.
+All eight run the b12x backends. They serve as `GLM-5.3-Flash` with
+auto context (`max-model-len -1`: the model cap of 1,048,576 clamped
+by the KV pool) and KV cache dtype `fp8_ds_mla`. The b2048 dflash
+pair and the two MTP scripts form a 2x2 grid: two speculation modes
+times two split sizes. Any two cells differ in exactly one thing so
+comparisons are clean. The b4096 dflash pair is the wider-step
+variant of the grid.
+
+### The KV pool, context size, concurrency
+
+The scripts reserve the KV pool (`kv-cache-memory-bytes`, 3.9 GiB
+per GPU on the NVFP4 preset) and leave `max-model-len` at `-1`
+(auto). Two numbers come out of that. Both move with the settings:
+
+- **Per-request cost** = `A * length + F`. `A` is the per-token KV
+  cost (about 3,366 bytes per token per GPU at fp8 with DCP2 after
+  the cache-group rebalance). `F` is the fixed per-request state
+  (GDN/mamba checkpoint bundles, about 0.9 GiB at the 4-sequence
+  worst case). The pool holds `pool / cost` concurrent requests.
+- **The reported "GPU KV cache size"** is `pool / (A + F/cap)`, where
+  cap is `max-model-len`. The fixed per-request state is amortized
+  over the cap, so a bigger cap reports a bigger number for the same
+  pool: a 327,680 cap reported 661,913 tokens, the 1,048,576 cap
+  reports 953,418. Concurrency at any given length stays the same
+  (about 2 requests of 327,680 either way). What the cap really sets
+  is the longest single request the server admits.
+
+Example mixes on the 3.9 GiB pool (per GPU, engine reservation
+arithmetic):
+
+| Mix | Cost | Fits |
+|---|---|---|
+| 1 x 950,272 tokens | 3.88 GiB | yes (1.00x) |
+| 2 x 327,680 tokens | 3.85 GiB | yes (2.02x) |
+| 3 x 327,680 tokens | 5.78 GiB | no |
+| 4 x 163,840 tokens | 5.65 GiB | no |
+| 4 x 131,072 tokens | 5.24 GiB | no |
+| 4 x 65,536 tokens | 4.42 GiB | no (close) |
+| 3 x 65,536 tokens | 3.31 GiB | yes |
+| 4 x 32,768 tokens | 3.98 GiB | no (hair over) |
+| 3 x 32,768 tokens | 3.00 GiB | yes |
+
+Concurrency is expensive per request: every extra concurrent
+request adds its own fixed state bundle on top of its token cost. The `F` above is
+the worst case (full 4-sequence bundle), so lighter mixes come out
+slightly better than this arithmetic.
+
+> [!TODO]
+> Explore `--mamba-ssm-cache-dtype bfloat16`. The SSM state runs fp32
+> by default (auto resolves to float32 for KDA) and the flag halves
+> those bytes. The raw states are a small slice of `F`, so measure
+> the effect on the rebalance line's max-request cost before
+> adoption.
 
 Two words explained:
 

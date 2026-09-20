@@ -40,7 +40,7 @@ MODEL_CONTAINER="${MODEL_ROOT}/${MODEL##*/}"
 TP_SIZE=2
 DCP_SIZE=1                    # no split. Draft memory stays local
 GPU_UTIL=0.986                 # weights take about 74 GiB per GPU. Rest is KV cache
-CONTEXT_SIZE=327680
+CONTEXT_SIZE=-1                      # auto: the model cap (1,048,576) clamped by the KV pool
 MAX_NUM_SEQS=6
 MAX_NUM_BATCHED_TOKENS=2048    # prompt tokens per step. Smaller = more KV space.
                                # Bigger = faster long-prompt reading
@@ -179,6 +179,9 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --dtype bfloat16 \
             --kv-cache-dtype "${KV_CACHE_DTYPE}" \
             --block-size "${BLOCK_SIZE}" \
+            # TODO: explore --mamba-ssm-cache-dtype bfloat16
+            # to divide the cache fixed cost by 2 (verify via the
+            # rebalance line's max-request cost before adoption)
             --mamba-cache-mode align \
             `# Parallelism` \
             --tensor-parallel-size "${TP_SIZE}" \
