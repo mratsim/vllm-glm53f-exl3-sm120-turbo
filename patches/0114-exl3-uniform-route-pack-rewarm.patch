@@ -1,0 +1,122 @@
+diff --git a/vllm/model_executor/layers/quantization/exl3.py b/vllm/model_executor/layers/quantization/exl3.py
+index aa5805a2cb..0874a26eef 100644
+--- a/vllm/model_executor/layers/quantization/exl3.py
++++ b/vllm/model_executor/layers/quantization/exl3.py
+@@ -147,6 +147,11 @@ _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
+ # geometry, the same way the mixed-bitrate buffers below are shared; layers
+ # execute sequentially, so a geometry-keyed arena is safe under capture.
+ _UNIFORM_EXECUTION_SCRATCH: dict[tuple[Any, ...], tuple[torch.Tensor, ...]] = {}
++# 0114: the uniform execution plans themselves, keyed by the same launch
++# geometry as _UNIFORM_EXECUTION_SCRATCH. The post-eviction rewarm re-runs
++# each plan's own B12X compile jobs so the raw route-pack launches survive
++# to the guarded capture (the uniform analogue of 0111's mixed rewarm).
++_UNIFORM_EXECUTION_PLANS: dict[tuple[Any, ...], Any] = {}
+ _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
+ # Mixed-bitrate scratch buffers are keyed by launch geometry and shared across
+ # layers owned by the same model or draft runner.
+@@ -632,6 +637,73 @@ def rewarm_mixed_route_packs() -> int:
+     return warmed
+ 
+ 
++def rewarm_uniform_route_packs() -> int:
++    """Re-run the uniform plans' B12X compile jobs after preparation eviction.
++
++    The uniform-K4 (full-rotation) runtime launches its route packs raw
++    (``launches=None``), and every B12X preparation job ends with
++    ``evict_unretained(keep)``. When the capture then JIT-misses a raw
++    route-pack specialization, the frozen session refuses it (the r5 boot
++    11 capture freeze). This is the uniform analogue of the 0111 mixed
++    rewarm: vLLM calls it after the last preparation job and kernel warmup,
++    immediately before capture, so these factory runs are the final writer
++    of the raw JIT cache. Each stored plan retains its own encoded compile
++    job payloads, so B12X's own factories run again with zero reconstructed
++    geometry. The prewarm dedup set must be cleared first, or the re-run
++    skips every launch exactly like the mixed rewarm's dedup set did.
++    """
++    if not _UNIFORM_EXECUTION_PLANS:
++        return 0
++    from b12x._lib import compile_pool as _b12x_compile_pool
++    from b12x.moe.fused_moe import _impl as _b12x_fused_impl
++    from b12x.preparation.device import detect_device
++
++    _b12x_fused_impl._W4A16_ROUTE_PACK_PREWARMED.clear()
++    jobs_run = 0
++    # The factories allocate their own dummy route tensors and launch real
++    # kernels; arena states are inference tensors during serving, and B12X
++    # zeroes scratch in place, which only InferenceMode permits here (the
++    # r5 boot 3 mixed-rewarm crash pattern).
++    with torch.inference_mode():
++        for plan in list(_UNIFORM_EXECUTION_PLANS.values()):
++            # The uniform path stores the planner's own output: a scalar
++            # Plan, or a _CompositePlan family holding one scalar child
++            # per planned token count. Each child carries its own encoded
++            # compile jobs, so the family must be flattened here (the r5
++            # boot 13 AttributeError on _CompositePlan._device).
++            children = (
++                tuple(plan.variants.values())
++                if hasattr(plan, "variants")
++                else (plan,)
++            )
++            for child in children:
++                device = detect_device(
++                    child._device
++                    if child._device is not None
++                    else getattr(child.query, "device", None)
++                )
++                configuration = child.contract.configure(
++                    child.query, device=device.identity, override=child.override
++                )
++                config = (
++                    configuration.default
++                    if configuration.pinned is None
++                    else configuration.pinned
++                )
++                for job in child._compile_jobs(config, device):
++                    factory = _b12x_compile_pool._factory(job.factory)
++                    factory(*job.args, **dict(job.kwargs))
++                    jobs_run += 1
++    logger.info(
++        "%s EXL3 uniform route-pack rewarm (post-eviction): "
++        "plans=%d compile-jobs=%d",
++        _REVISION_TAG,
++        len(_UNIFORM_EXECUTION_PLANS),
++        jobs_run,
++    )
++    return jobs_run
++
++
+ def _load_b12x_trellis_linear() -> Any:
+     """Resolve the native dense Trellis API lazily."""
+ 
+@@ -5018,6 +5090,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+                 for spec in plan.scratch_specs()
+             )
+             _UNIFORM_EXECUTION_SCRATCH[scratch_key] = scratch
++        # 0114: remember the plan for the post-eviction route-pack rewarm.
++        # The plan retains its encoded compile-job payloads, so the rewarm
++        # re-runs B12X's own factories with zero reconstructed geometry.
++        _UNIFORM_EXECUTION_PLANS.setdefault(scratch_key, plan)
+         layer.exl3_execution_scratch = scratch
+         from vllm.model_executor.layers.fused_moe.b12x import (
+             _prepared_moe_call_factory,
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 71fc11d7ea..7fcc074cc4 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -959,8 +959,16 @@ class Worker(WorkerBase):
+         if not self.model_config.enforce_eager:
+             from vllm.model_executor.layers.quantization.exl3 import (
+                 rewarm_mixed_route_packs,
++                rewarm_uniform_route_packs,
+             )
+             rewarm_mixed_route_packs()
++            # 0114: the uniform-K4 (full-rotation) path launches its route
++            # packs raw and B12X's preparation eviction drops those raw JIT
++            # entries, so the guarded capture froze on the first unwarmed
++            # specialization (r5 boot 11). Re-run the uniform plans' own
++            # compile jobs here so these launches are the final writer of
++            # the raw JIT cache before capture begins.
++            rewarm_uniform_route_packs()
+ 
+         cuda_graph_memory_bytes = 0
+         if not self.model_config.enforce_eager:

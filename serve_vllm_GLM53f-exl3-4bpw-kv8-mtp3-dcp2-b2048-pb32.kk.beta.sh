@@ -21,7 +21,7 @@ LOCAL_MODELS="${LOCAL_MODELS:-$HOME/local_models}"
 DIR=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
 ROOTFS_CACHE="${DIR}/cache-rootfs"
 
-mkdir -p "${HF_CACHE}" "${ROOTFS_CACHE}"
+mkdir -p "${HF_CACHE}" "${ROOTFS_CACHE}/triton" "${ROOTFS_CACHE}/inductor" "${ROOTFS_CACHE}/b12x"
 mkdir -p "${DIR}/container-tmp"
 
 # ============================================================
@@ -38,7 +38,7 @@ MODEL_CONTAINER="${MODEL_ROOT}/${MODEL##*/}"
 # ============================================================
 TP_SIZE=2
 DCP_SIZE=2                     # the GPUs split the saved conversation (~2x KV space)
-GPU_UTIL=0.98                  # 0.95 leaves nothing for the KV cache here
+GPU_UTIL=0.97                  # ~3% headroom: serving-time Triton JIT OOMs at 0.986 (r5 boot 5)
 CONTEXT_SIZE=327680
 MAX_NUM_SEQS=6
 MAX_NUM_BATCHED_TOKENS=1024    # prompt tokens per step. Smaller = more KV space
@@ -49,8 +49,9 @@ MTP_TOKENS=3                   # the MTP draft part ships inside the model file
 REASONING_EFFORT=high          # low or high. The template default is max and it talks too much.
 HEALTH_START_PERIOD=600
 
-# Expert parallelism. Each GPU keeps 144 whole experts (this checkpoint only)
-EP_FLAG=(--enable-expert-parallel)
+# Expert parallelism is GONE from the karmic b12x runtime surface (the new
+# plan_execution contract has no expert maps). Uniform-K4 runs TP-sharded.
+EP_FLAG=()
 
 # Ready-made graph sizes. Spec decoding on: (K+1) x seqs. Off: 4 x seqs
 if (( MTP_TOKENS > 0 ))
@@ -93,6 +94,11 @@ VLLM_ENV+=(
     -e NCCL_P2P_DISABLE=1
     -e VLLM_EXL3_PREFILL_BLOCK_M=32
     -e VLLM_EXL3_PREFILL_TRELLIS=1
+    # The uniform-K4 compile factory primes its real-launch variants with
+    # live CUDA tensors. That only works in-process: pool workers hide
+    # CUDA (r5 boots 9+10). 0 = compile_in_process, the mode the
+    # full-rotation prewarm is designed for.
+    -e B12X_COMPILE_WORKERS=0
     -e VLLM_GLM53_MTP_DRAFT_HEAD=bf16
     -e CUBLAS_WORKSPACE_CONFIG=:4096:1
 )
@@ -128,7 +134,7 @@ VLLM_EXTRA+=(
 {
   printf 'launch %s as %s\n' "${MODEL_CONTAINER}" "${MODELNAME}"
   printf '  image        %s\n' "${IMAGE}"
-  printf '  parallel     tp=%s dcp=%s ep=yes\n' "${TP_SIZE}" "${DCP_SIZE}"
+  printf '  parallel     tp=%s dcp=%s ep=no (uniform K4: TP2 sharded experts)\n' "${TP_SIZE}" "${DCP_SIZE}"
   printf '  quant        exl3 (TR3 uniform K4, routed experts only), kv=%s, block=%s\n' "${KV_CACHE_DTYPE}" "${BLOCK_SIZE}"
   printf '  context      %s tokens, mem-fraction=%s\n' "${CONTEXT_SIZE}" "${GPU_UTIL}"
   printf '  batching     max-seqs=%s, batched-tokens=%s, graph-cap=%s\n' "${MAX_NUM_SEQS}" "${MAX_NUM_BATCHED_TOKENS}" "${GRAPH_CAP}"
@@ -158,6 +164,9 @@ podman run --replace --detach --restart=always \
     -v "${DIR}/container-tmp":/container-tmp \
     -v "${DIR}/chat_template.multimodal.jinja":/opt/glm53f/chat_template.multimodal.jinja:ro \
     -e TMPDIR=/container-tmp \
+    -e TRITON_CACHE_DIR=/cache/triton \
+    -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor \
+    -e B12X_COMPILE_CACHE_DIR=/cache/b12x \
     "${VLLM_ENV[@]}" \
     "${IMAGE}" \
         -lc 'unset MAX_NUM_BATCHED_TOKENS MAX_CUDAGRAPH_CAPTURE_SIZE CUDAGRAPH_CAPTURE_SIZES PREFILL_SCHEDULE_INTERVAL FAIRNESS_ENGINE PREFILL_COMPUTE_SHARE VLLM_PCIE_ALLREDUCE_BACKEND VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE

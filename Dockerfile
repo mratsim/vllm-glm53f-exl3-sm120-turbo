@@ -28,6 +28,12 @@
 #   0108  rejection-sampler padding mask: padded draft rows masked to -1 (is_padding).
 #   0111  gpu_worker: re-run the 0101 route-pack warmup after the last preparation job,
 #         before the guarded capture (preparation eviction drops raw JIT entries).
+#   0112  uniform-K4 session-contract port: plan_execution + preparation-session
+#         registration, bind/run serving. EP raises loudly at weight prep.
+#   0113  b12x: the full-rotation W4A16 prewarm declares its route-pack programs
+#         (FakeTensor compile-only warmups under planning()/offline workers).
+#   0114  uniform route-pack rewarm before capture: clears the prewarm dedup set,
+#         flattens _CompositePlan families, re-runs each child's b12x compile jobs.
 #   0201  [deleted] BTX adoption overlay, superseded by the 0101 vllm-side re-home.
 #   0202  [deleted] w4a16 trellis3 mixed API, present at both b12x revisions.
 #         The build-time check still verifies the symbol.
@@ -56,7 +62,7 @@ LABEL ai.vllm.base.tag="karmic-kraken-beta-20260919-cfc67a15ebc3daf7" \
       ai.vllm.base.pins="vllm=67bb922f6f4(integration/karmic-kraken-beta),b12x=eea3ced11fc1,exllamav3=704aefd743b,cuda=13.4.1,torch=2.14" \
       ai.vllm.exllamav3.repo="${EXLLAMAV3_REPO}" \
       ai.vllm.exllamav3.commit="${EXLLAMAV3_COMMIT}" \
-      ai.vllm.patchset="0101-exl3-adapter,0102-exl3-quant-registration,0103-exl3-config-detection,0104-routed-experts-per-expert-trellis,0105-exl3-b12x13-rate-contract,0106-exl3-adoption-alias-and-guards,0107-exl3-path-audit-logs,0108-rejection-sampler-padding-mask,0111-gpu-worker-route-pack-rewarm,0301-exl3-mixed-rate-gate" \
+      ai.vllm.patchset="0101-exl3-adapter,0102-exl3-quant-registration,0103-exl3-config-detection,0104-routed-experts-per-expert-trellis,0105-exl3-b12x13-rate-contract,0106-exl3-adoption-alias-and-guards,0107-exl3-path-audit-logs,0108-rejection-sampler-padding-mask,0111-gpu-worker-route-pack-rewarm,0112-exl3-uniform-plan-execution,0113-b12x-full-rotation-planning-clean,0114-exl3-uniform-route-pack-rewarm,0301-exl3-mixed-rate-gate" \
       ai.vllm.patchset.deleted="0201-b12x-btx-adoption(re-homed-vllm-side),0202-b12x-trellis3-mixed-api(absorbed-upstream)" \
       ai.vllm.revision="${VLLM_GLM53F_EXL3_REVISION}" \
       ai.vllm.target.checkpoint="brandonmusic/GLM-5.3-Flash-tr3-4bpw,satgeze/GLM-5.3-Flash-EXL3-TR3-3.5bpw" \
@@ -182,14 +188,54 @@ RUN set -eu; \
       || { echo "0101 adoption re-home missing" >&2; exit 1; }; \
     grep -q 'warm_route_pack(' \
       "$V/model_executor/layers/quantization/exl3.py" \
-      || { echo "0101 route-pack warmup missing: b12x capture freeze would kill the first boot (JOURNEY 74)" >&2; exit 1; }; \
+      || { echo "0101 route-pack warmup missing: b12x capture freeze would kill the first boot" >&2; exit 1; }; \
     grep -q 'def rewarm_mixed_route_packs' \
       "$V/model_executor/layers/quantization/exl3.py" \
       || { echo "0111 post-eviction route-pack rewarm missing: preparation jobs evict the" \
            "construction-time warmup and the guarded capture freezes on the first" \
-           "unwarmed specialization (JOURNEY r5 boot 2)" >&2; exit 1; }; \
+           "unwarmed specialization (the r5 boot 2 freeze)" >&2; exit 1; }; \
     grep -q 'rewarm_mixed_route_packs()' "$V/v1/worker/gpu_worker.py" \
       || { echo "0111 gpu_worker rewarm call missing: the rewarm must run after the last" \
+           "preparation job and immediately before the guarded capture" >&2; exit 1; }; \
+    grep -q 'def get_b12x_preparation_units' \
+      "$V/model_executor/layers/quantization/exl3.py" \
+      || { echo "0112 session provider missing: uniform-K4 plans must register with the b12x" \
+           "weights-stage session or the first guarded capture freezes like boot 2" >&2; exit 1; }; \
+    grep -q 'plan_execution(' \
+      "$V/model_executor/layers/quantization/exl3.py" \
+      || { echo "0112 plan_execution missing: the karmic b12x deleted api.Caps/api.plan and the" \
+           "uniform runtime must use the session contract" >&2; exit 1; }; \
+    if grep -q 'api\.Caps(\|api\.plan(' \
+       "$V/model_executor/layers/quantization/exl3.py"; then \
+      echo "0112 leftover dead surface: api.Caps/api.plan calls survive in exl3.py" \
+           "(deleted at b12x eea3ced - they would AttributeError after the weight plan)" >&2; exit 1; \
+    fi; \
+    grep -q 'set_b12x_preparation_provider(layer, self)' \
+      "$V/model_executor/layers/quantization/exl3.py" \
+      || { echo "0112 provider registration missing: the driver walk discovers uniform layers" \
+           "through b12x_preparation_provider" >&2; exit 1; }; \
+    grep -q 'planning() or _OFFLINE_COMPILE_DEVICE_ORDINAL is not None' \
+      "$SP/b12x/moe/fused_moe/_impl.py" \
+      || { echo "0113 b12x compile-context guard missing: the full-rotation prewarm body" \
+           "must declare instead of launch under planning() (describe, the r5 boot 8" \
+           "failure) and in offline compiler workers (CUDA hidden, the r5 boot 9" \
+           "failure), or uniform-K4 can neither describe nor compile" >&2; exit 1; }; \
+    grep -q 'compile_only_launches()' "$SP/b12x/moe/fused_moe/_impl.py" \
+      || { echo "0113 v3 declare-branch missing: skipping the prewarm under planning()" \
+           "leaves the real-shape route-pack keys undeclared, and the instantiate" \
+           "subset invariant then rejects them (the r5 boot 10 failure class)" >&2; exit 1; }; \
+    grep -q 'def rewarm_uniform_route_packs' \
+      "$V/model_executor/layers/quantization/exl3.py" \
+      || { echo "0114 uniform rewarm missing: the full-rotation runtime launches" \
+           "route packs raw and preparation eviction drops them, so the guarded" \
+           "capture freezes on the first unwarmed specialization (the r5 boot 11" \
+           "failure)" >&2; exit 1; }; \
+    grep -q '_W4A16_ROUTE_PACK_PREWARMED.clear()' \
+      "$V/model_executor/layers/quantization/exl3.py" \
+      || { echo "0114 dedup-set clear missing: without it the rewarm is a no-op" \
+           "after the session's own prewarm marked the keys (the 0101 lesson)" >&2; exit 1; }; \
+    grep -q 'rewarm_uniform_route_packs()' "$V/v1/worker/gpu_worker.py" \
+      || { echo "0114 gpu_worker call missing: the rewarm must run after the last" \
            "preparation job and immediately before the guarded capture" >&2; exit 1; }; \
     grep -q '_REVISION_TAG = "\[mratsim.s sm120-turbo r[0-9][0-9]*\]"' \
       "$V/model_executor/layers/quantization/exl3.py" \

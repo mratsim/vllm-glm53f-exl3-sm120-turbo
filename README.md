@@ -39,9 +39,9 @@ names end with the prefill block (pb32 or pb64).
 
 All eight: b12x backends, served as `GLM-5.3-Flash`, 327,680 context,
 KV cache dtype `fp8_ds_mla`. The b2048 dflash pair and the two MTP
-scripts form a 2x2 grid: two speculation modes times two split sizes.
-Any two cells differ in exactly one thing, so comparisons are clean.
-The b4096 dflash pair is the wider-step variant of the grid.
+scripts form a 2x2 grid: two speculation modes times two split sizes,
+and any two cells differ in exactly one thing so comparisons are
+clean. The b4096 dflash pair is the wider-step variant of the grid.
 
 Two words explained:
 
@@ -54,6 +54,18 @@ Two words explained:
 
 ## Measured results
 
+> [!WARNING]
+> **Every number in this section was measured on the previous base image**
+> `jovian-judgement-community-20260914-r38`
+> (vLLM built from `lil-vllm` `dev/jovian-judgement` at commit
+> [`66c29357`](https://github.com/local-inference-lab/lil-vllm), the image
+> banner commit, with the checkout tip at `5bca5a58d9`). The stack has since
+> moved to the **`karmic-kraken-beta` base** (vLLM wheel built from source
+> commit `67bb922f6f4` on `integration/karmic-kraken-beta`, b12x at
+> `eea3ced11fc1`). Those numbers have **not** been re-measured on the
+> karmic base. Treat them as indicative of the r38 rig behavior until
+> the karmic re-benchmark numbers exist.
+
 All numbers measured on this rig: two RTX PRO 6000 Blackwell cards on
 the NVIDIA open kernel driver, PCIe gen5 x8/x8, power-limited to
 360 W per GPU.
@@ -65,8 +77,9 @@ so card-to-card traffic crosses the CPU over host NCCL (the launchers
 set `NCCL_P2P_DISABLE=1` with `VLLM_ENABLE_PCIE_ALLREDUCE=0` for this).
 
 Benchmarked with [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench).
-External prefill claims run higher power envelopes (cstechdev 400 W,
-Raul2718 500 W).
+
+External prefill claims run higher power envelopes (cstechdev 400 W
+and Raul2718 500 W).
 
 | Checkpoint | Speculation | KV split | Step size | Prefill block M | KV pool | KV tokens | Chats @ 327,680 | prefill tok/s | decode tok/s |
 |---|---|---|---|---|---|---|---|---|---|
@@ -174,9 +187,9 @@ often:
 MTP does not need the split: its draft is one shared head
 with almost no KV of its own.
 
-The draft attention must advertise `supports_dcp_replicated`. Only
-`FLASH_ATTN` does at this base commit (`TRITON_ATTN` fails).
-Prefix caching stays on.
+The draft attention must advertise `supports_dcp_replicated`, a
+property only `FLASH_ATTN` has at this base commit (`TRITON_ATTN`
+fails), while prefix caching stays on.
 
 ## When the base image updates
 
@@ -187,7 +200,12 @@ podman pull <new-tag>
 # a failing git apply --check means re-anchor the patches. Never force it.
 ```
 
-The tag follows `<stack-name>:<revision>`. Keep the Dockerfile ARG, the podman tag, the script IMAGE lines in sync on every revision bump.
+The tag follows `<stack-name>:<revision>`. On every revision bump
+keep these three in sync:
+- the Dockerfile `ARG`
+- the podman tag
+- the script `IMAGE` lines
+
 The Dockerfile stamps the revision into the 0107 log marker and asserts
 the token is fully consumed.
 

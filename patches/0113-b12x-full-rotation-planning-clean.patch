@@ -1,0 +1,111 @@
+diff --git a/b12x/moe/fused_moe/_impl.py b/b12x/moe/fused_moe/_impl.py
+index bf9918ec..f83f5a87 100644
+--- a/b12x/moe/fused_moe/_impl.py
++++ b/b12x/moe/fused_moe/_impl.py
+@@ -19,10 +19,16 @@ import torch
+ import torch.nn.functional as F
+ from torch.profiler import record_function
+ 
+-from b12x._lib.compile_plan import launch_triton, planning
++from b12x._lib.compile_plan import (
++    compile_only_launches,
++    launch_triton,
++    observe_programs,
++    planning,
++)
+ from b12x._lib.program_cache import register_program_cache
+ from b12x._lib.compiler import (
+     KernelCompileSpec,
++    _OFFLINE_COMPILE_DEVICE_ORDINAL,
+     compile as b12x_compile,
+ )
+ from b12x._lib.intrinsics import (
+@@ -8031,6 +8037,88 @@ def _plan_full_rotation_w4a16_launches(
+             for mapped in (False, True)
+             for broadcast_svh in (False, True)
+         )
++        if planning() or _OFFLINE_COMPILE_DEVICE_ORDINAL is not None:
++            # A metadata-only factory pass cannot launch, and an offline
++            # compiler worker has no device. Declare the prewarm programs
++            # the way compile_mhc does: FakeTensorMode keeps the scratch
++            # allocations symbolic, and compile-only warmups lower the
++            # exact real-shape variants. Shapes, dtypes and constexprs
++            # match the real launches, so the recorded keys are the keys
++            # serving records, and they ride on the returned carriers so
++            # the described program set covers them and eviction keeps
++            # them. No sync happens and _W4A16_ROUTE_PACK_PREWARMED is
++            # untouched: the real compile pass and the runtime prewarm
++            # still prime for real.
++            from torch._subclasses.fake_tensor import FakeTensorMode
++
++            with (
++                FakeTensorMode(),
++                compile_only_launches(),
++                observe_programs() as route_pack_programs,
++            ):
++                packed_route_indices = torch.empty(
++                    capacity_route_slots,
++                    dtype=torch.int32,
++                    device=core_plan.device,
++                )
++                block_expert_ids = torch.empty(
++                    capacity_m_blocks,
++                    dtype=torch.int32,
++                    device=core_plan.device,
++                )
++                packed_route_count = torch.empty(
++                    1,
++                    dtype=torch.int32,
++                    device=core_plan.device,
++                )
++                expert_offsets = torch.empty(
++                    core_plan.route_E + 1,
++                    dtype=torch.int32,
++                    device=core_plan.device,
++                )
++                expert_counts = torch.empty(
++                    core_plan.route_E,
++                    dtype=torch.int32,
++                    device=core_plan.device,
++                )
++                for route_ids_dtype in (torch.int32, torch.int64):
++                    dummy_topk_ids = torch.zeros(
++                        capacity_tokens,
++                        core_plan.num_topk,
++                        dtype=route_ids_dtype,
++                        device=core_plan.device,
++                    )
++                    for mapped in (False, True):
++                        expert_map = None
++                        if mapped:
++                            expert_map = torch.arange(
++                                core_plan.route_E,
++                                dtype=torch.int32,
++                                device=core_plan.device,
++                            )
++                        for token_count in route_pack_warmup_token_counts(capacity_tokens):
++                            pack_topk_routes_by_expert(
++                                dummy_topk_ids[:token_count],
++                                block_size_m,
++                                core_plan.route_E,
++                                expert_map=expert_map,
++                                packed_route_indices=packed_route_indices,
++                                block_expert_ids=block_expert_ids,
++                                packed_route_count=packed_route_count,
++                                expert_offsets=expert_offsets,
++                                expert_counts=expert_counts,
++                            )
++            declared = tuple(dict.fromkeys(route_pack_programs))
++            for launches in (fused_launches, topk_sum_launches):
++                for item in launches:
++                    carrier = item[-1]
++                    prior = getattr(carrier, "__b12x_programs__", ())
++                    object.__setattr__(
++                        carrier,
++                        "__b12x_programs__",
++                        tuple(dict.fromkeys((*prior, *declared))),
++                    )
++            return fused_launches, topk_sum_launches
+         packed_route_indices = torch.empty(
+             capacity_route_slots,
+             dtype=torch.int32,

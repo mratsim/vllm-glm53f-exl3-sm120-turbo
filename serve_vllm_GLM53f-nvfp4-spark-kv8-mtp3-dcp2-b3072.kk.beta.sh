@@ -1,11 +1,8 @@
 #!/bin/bash
+# GLM-5.3-Flash NVFP4 Spark (local-inference-lab). 8-bit KV cache,
+# MTP-3, GPUs split (DCP=2). Aligned to the official glm53-spark-tp2
+# preset (lil-docker-builds runtime/presets.yaml + profiles/glm53-flash).
 set -euo pipefail
-
-# ============================================================
-# GLM-5.3-Flash 3.5bpw (satgeze). DFlash2 draft, no
-# conversation split (DCP=1). Wider batching: 4096
-# tokens per step
-# ============================================================
 
 # ============================================================
 # Image
@@ -28,44 +25,47 @@ mkdir -p "${HF_CACHE}" "${ROOTFS_CACHE}/triton" "${ROOTFS_CACHE}/inductor" "${RO
 mkdir -p "${DIR}/container-tmp"
 
 # ============================================================
-# Model: GLM-5.3-Flash-EXL3-TR3-3.5bpw local snapshot
-# (satgeze/GLM-5.3-Flash-EXL3-TR3-3.5bpw, mixed K3/K4 per-expert rates)
+# Model
 # ============================================================
 MODELNAME="GLM-5.3-Flash"
-MODEL_ROOT=/workspace/local_models
-MODEL="${LOCAL_MODELS}"/GLM-5.3-Flash-EXL3-TR3-3.5bpw
-MODEL_CONTAINER="${MODEL_ROOT}/${MODEL##*/}"
+MODEL="${LOCAL_MODELS}"/GLM-5.3-Flash-NVFP4-Spark
 
 # ============================================================
-# Settings
+# Settings (official glm53-spark-tp2 preset values)
 # ============================================================
 TP_SIZE=2
-DCP_SIZE=1                     # no split. Half the KV space of the -dcp2 file
-GPU_UTIL=0.95                 # weights take about 74 GiB per GPU. MNBT 4096 scratch needs headroom
+DCP_SIZE=2
+GPU_UTIL=0.985
 CONTEXT_SIZE=327680
-MAX_NUM_SEQS=6
-MAX_NUM_BATCHED_TOKENS=4096    # prompt tokens per step. Wider = faster prefill, bigger scratch
-                               # Bigger = faster long-prompt reading
-KV_CACHE_DTYPE=fp8_ds_mla
+MAX_NUM_SEQS=4
+MAX_NUM_BATCHED_TOKENS=3072
+KV_CACHE_MEMORY_BYTES=4190109696   # 3996 MiB per GPU, pinned
+KV_OFFLOADING_SIZE=64             # GiB native host KV tier; empty/0 disables
+KV_CACHE_DTYPE=fp8
 BLOCK_SIZE=256
-CP_KV_INTERLEAVE=4             # both split modes use the same value (4)
-# DFlash2 draft, 7 tokens guessed per step. The -mtp3 files run MTP instead
-DFLASH_TOKENS=7               # how many tokens ahead the draft guesses each step
-# No split: the draft memory is local, but the page rules below still apply
-DFLASH_MODEL="${LOCAL_MODELS}"/GLM-5.3-Flash-DFlash2-MXFP8
-                              # Small draft model beside the main model.
-                              # Wrong guesses are thrown away, output stays exact
-REASONING_EFFORT=high          # low or high. The template default is max and it talks too much.
+CP_KV_INTERLEAVE=4
+MTP_TOKENS=3
+REASONING_EFFORT=high
 HEALTH_START_PERIOD=600
-
-# No expert parallelism. Only the uncut experts of the 4bpw file support it
-EP_FLAG=()
+# Native offload pins/registers the GPU cache allocations, so PyTorch's
+# remappable VMM segments must be off and the native-L2 keys stable
+# across restarts (the same contract as the DeepSeek launcher).
+ALLOC_CONF="expandable_segments:True,large_segment_size_mb:12"
+VLLM_OFFLOAD=()
+if [[ -n "${KV_OFFLOADING_SIZE}" && "${KV_OFFLOADING_SIZE}" != "0" ]]
+then
+    ALLOC_CONF="expandable_segments:False"
+    VLLM_OFFLOAD=(
+        -e PYTHONHASHSEED=0
+        --kv-offloading-size "${KV_OFFLOADING_SIZE}"
+        --kv-offloading-backend native
+    )
+fi
 
 # Ready-made graph sizes. Spec decoding on: (K+1) x seqs. Off: 4 x seqs
-SPEC_K=${DFLASH_TOKENS}      # the rule above, with speculative decoding on
-if (( SPEC_K > 0 ))
+if (( MTP_TOKENS > 0 ))
 then
-    GRAPH_CAP=$(( MAX_NUM_SEQS * (SPEC_K + 1) ))
+    GRAPH_CAP=$(( MAX_NUM_SEQS * (MTP_TOKENS + 1) ))
 else
     GRAPH_CAP=$(( MAX_NUM_SEQS * 4 ))
 fi
@@ -95,17 +95,39 @@ VLLM_EXTRA=()
 VLLM_ENV+=(
     -e VLLM_ENGINE_READY_TIMEOUT_S=${HEALTH_START_PERIOD}
     -e VLLM_ENGINE_ITERATION_TIMEOUT_S=120
-    -e OMP_NUM_THREADS=4
+    -e OMP_NUM_THREADS=1
     -e HF_HUB_OFFLINE=1
+    -e TRANSFORMERS_OFFLINE=1
     -e SAFETENSORS_FAST_GPU=1
     -e VLLM_USE_V2_MODEL_RUNNER=1
     -e VLLM_ENABLE_PCIE_ALLREDUCE=0
     -e NCCL_P2P_DISABLE=1
-    # EXL3 settings. Also set inside the image
-    -e VLLM_EXL3_PREFILL_BLOCK_M=64
-    -e VLLM_EXL3_PREFILL_TRELLIS=1
-    -e VLLM_GLM53_MTP_DRAFT_HEAD=bf16
+    -e NCCL_SOCKET_IFNAME=lo
+    -e GLOO_SOCKET_IFNAME=lo
+    -e NCCL_MIN_NCHANNELS=2
+    -e NCCL_MAX_NCHANNELS=2
+    -e NCCL_BUFFSIZE=1048576
+    -e NCCL_NET_PLUGIN=none
+    -e NCCL_TUNER_PLUGIN=none
+    -e CUTE_DSL_ARCH=sm_120a
+    -e PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF}
     -e CUBLAS_WORKSPACE_CONFIG=:4096:1
+    -e VLLM_GLM53_MTP_DRAFT_HEAD=nvfp4
+    -e VLLM_MXFP8_LM_HEAD=0
+    -e VLLM_MTP_NVFP4_LM_HEAD=0
+    -e VLLM_LM_HEAD_A16=1
+    -e VLLM_B12X_MOE_FP4_FORCE_A16=0
+    -e VLLM_DISABLED_KERNELS=MarlinFP8ScaledMMLinearKernel
+    -e VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS=65536
+    -e VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE=2048
+    -e VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE=auto
+    -e B12X_MHC_PDL=1
+    -e VLLM_GLM53_L2_PREFETCH=1
+    -e VLLM_GLM53_L2_PREFETCH_PERSIST_MB=0
+    -e VLLM_GLM53_DFLASH_ATTN=1
+    -e VLLM_CAUSAL_CONV1D_UPDATE_HOIST=1
+    -e VLLM_GLM53_KDA_GATE_SIDE_STREAM=1
+    -e VLLM_USE_FLASHINFER_SAMPLER=1
 )
 
 # Use the b12x fast code for attention and for the expert layers
@@ -115,26 +137,20 @@ VLLM_BACKEND=(
     --linear-backend b12x
 )
 
-# Speculative decoding. b12x picks the right kernel for the draft size automatically FLASH_ATTN runs
-# the draft. Tested on these cards, handles its odd layers
-# The draft memory stays BF16. Adds about 0.6 GiB per GPU
-DFLASH_MOUNT=(-v "${DFLASH_MODEL}":/draft:ro)
-# The memory bookkeeping needs pages lined up to 8448-byte
-# steps. The draft breaks that, so pages are split to line
-# up by design. The split width is 4608.
-# Needs mamba-cache-mode align below
-VLLM_ENV+=(-e VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE=4608)
-VLLM_SPEC=(
-    --speculative-config \
-    "{\"method\":\"dflash\",\"model\":\"/draft\",\"num_speculative_tokens\":${DFLASH_TOKENS},\"draft_tensor_parallel_size\":${TP_SIZE},\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"standard\",\"attention_backend\":\"FLASH_ATTN\",\"kv_cache_dtype\":\"auto\"}"
-)
+# Speculative decoding. The draft part is inside the model file
+if [[ "${MTP_TOKENS}" != "0" ]]
+then
+    VLLM_SPEC=(
+        --speculative-config \
+        "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_TOKENS},\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"standard\",\"moe_backend\":\"b12x\",\"attention_backend\":\"B12X\"}"
+    )
+fi
 
 VLLM_EXTRA+=(
     --disable-custom-all-reduce
     --prefill-compute-share 0.4
     --prefill-schedule-interval 1
-    --mm-encoder-attn-backend TORCH_SDPA
-    --limit-mm-per-prompt '{"video":0}'
+    --max-parallel-prefills 1
     --no-enable-flashinfer-autotune
 )
 
@@ -142,14 +158,14 @@ VLLM_EXTRA+=(
 # Startup summary
 # ============================================================
 {
-  printf 'launch %s as %s\n' "${MODEL_CONTAINER}" "${MODELNAME}"
+  printf 'launch %s as %s\n' "${MODEL}" "${MODELNAME}"
   printf '  image        %s\n' "${IMAGE}"
-  printf '  parallel     tp=%s dcp=%s ep=no (mixed rates: TP2 sharded experts)\n' "${TP_SIZE}" "${DCP_SIZE}"
-  printf '  quant        exl3 (TR3 mixed K3/K4 per-expert, routed experts only), kv=%s, block=%s\n' "${KV_CACHE_DTYPE}" "${BLOCK_SIZE}"
-  printf '  context      %s tokens, mem-fraction=%s\n' "${CONTEXT_SIZE}" "${GPU_UTIL}"
+  printf '  parallel     tp=%s dcp=%s\n' "${TP_SIZE}" "${DCP_SIZE}"
+  printf '  quant        nvfp4 (modelopt_mixed), kv=%s, block=%s\n' "${KV_CACHE_DTYPE}" "${BLOCK_SIZE}"
+  printf '  context      %s, kv-pool=%s bytes/gpu, mem-fraction=%s\n' "${CONTEXT_SIZE}" "${KV_CACHE_MEMORY_BYTES}" "${GPU_UTIL}"
   printf '  batching     max-seqs=%s, batched-tokens=%s, graph-cap=%s\n' "${MAX_NUM_SEQS}" "${MAX_NUM_BATCHED_TOKENS}" "${GRAPH_CAP}"
-  printf '  speculation  dflash2 (K=%s)\n' "${SPEC_K}"
-  printf '  reasoning    %s\n' "${REASONING_EFFORT}"
+  printf '  speculation  mtp (K=%s, probabilistic)\n' "${MTP_TOKENS}"
+  printf '  offloading   %s\n' "$([ -n "${KV_OFFLOADING_SIZE}" ] && [ "${KV_OFFLOADING_SIZE}" != "0" ] && echo "native ${KV_OFFLOADING_SIZE} GiB" || echo off)"
 } >&2
 
 # ============================================================
@@ -172,39 +188,43 @@ podman run --replace --detach --restart=always \
     -v "${HF_CACHE}":/root/.cache/huggingface:ro \
     -v "${DIR}/container-tmp":/container-tmp \
     -v "${DIR}/chat_template.multimodal.jinja":/opt/glm53f/chat_template.multimodal.jinja:ro \
-    "${DFLASH_MOUNT[@]}" \
     -e TMPDIR=/container-tmp \
     -e TRITON_CACHE_DIR=/cache/triton \
     -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor \
     -e B12X_COMPILE_CACHE_DIR=/cache/b12x \
     "${VLLM_ENV[@]}" \
+    "${VLLM_OFFLOAD[@]}" \
     "${IMAGE}" \
-        -lc 'unset MAX_NUM_BATCHED_TOKENS MAX_CUDAGRAPH_CAPTURE_SIZE CUDAGRAPH_CAPTURE_SIZES PREFILL_SCHEDULE_INTERVAL FAIRNESS_ENGINE PREFILL_COMPUTE_SHARE VLLM_PCIE_ALLREDUCE_BACKEND VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE
+        -lc 'unset MAX_NUM_BATCHED_TOKENS MAX_CUDAGRAPH_CAPTURE_SIZE CUDAGRAPH_CAPTURE_SIZES PREFILL_SCHEDULE_INTERVAL FAIRNESS_ENGINE PREFILL_COMPUTE_SHARE VLLM_PCIE_ALLREDUCE_BACKEND VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE MAX_MODEL_LEN
 exec /opt/venv/bin/vllm serve "$@"' -- \
-            "${MODEL_CONTAINER}" \
+            "${MODEL}" \
             `# Networking` \
             --host 0.0.0.0 \
             --port "${VLLM_PORT}" \
             `# Model identity` \
             --served-model-name "${MODELNAME}" \
             `# Quantization` \
-            --quantization exl3 \
+            `# nvfp4: modelopt_mixed, no --trust-remote-code` \
+            --quantization modelopt_mixed \
+            --load-format safetensors \
             --dtype bfloat16 \
             --kv-cache-dtype "${KV_CACHE_DTYPE}" \
             --block-size "${BLOCK_SIZE}" \
             --mamba-cache-mode align \
+            --recurrent-checkpoint-policy request_boundaries \
+            --enable-prefix-caching \
+            --enable-chunked-prefill \
             `# Parallelism` \
             --tensor-parallel-size "${TP_SIZE}" \
             --decode-context-parallel-size "${DCP_SIZE}" \
             --cp-kv-cache-interleave-size "${CP_KV_INTERLEAVE}" \
             --dcp-kv-cache-interleave-size "${CP_KV_INTERLEAVE}" \
-            "${EP_FLAG[@]}" \
             `# Resource limits` \
-            --gpu-memory-utilization "${GPU_UTIL}" \
             --max-model-len "${CONTEXT_SIZE}" \
             --max-num-seqs "${MAX_NUM_SEQS}" \
             --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
-            --max-cudagraph-capture-size "${GRAPH_CAP}" \
+            --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" \
+            --gpu-memory-utilization "${GPU_UTIL}" \
             --compilation-config "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"cudagraph_capture_sizes\":[${SIZES_CSV}]}" \
             `# Tokenizer / tools / reasoning` \
             --reasoning-parser glm45 \
@@ -212,6 +232,7 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --enable-auto-tool-choice \
             --chat-template /opt/glm53f/chat_template.multimodal.jinja \
             --default-chat-template-kwargs.reasoning_effort="${REASONING_EFFORT}" \
+            --default-chat-template-kwargs.clear_thinking=false \
             `# b12x KDA prefill auto-engages on karmic` \
             `# the old kda_prefill_backend key fails the karmic resolver` \
             `# Serving statistics` \

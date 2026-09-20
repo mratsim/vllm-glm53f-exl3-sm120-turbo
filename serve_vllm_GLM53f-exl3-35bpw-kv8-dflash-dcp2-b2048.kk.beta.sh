@@ -22,7 +22,7 @@ LOCAL_MODELS="${LOCAL_MODELS:-$HOME/local_models}"
 DIR=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
 ROOTFS_CACHE="${DIR}/cache-rootfs"
 
-mkdir -p "${HF_CACHE}" "${ROOTFS_CACHE}"
+mkdir -p "${HF_CACHE}" "${ROOTFS_CACHE}/triton" "${ROOTFS_CACHE}/inductor" "${ROOTFS_CACHE}/b12x"
 mkdir -p "${DIR}/container-tmp"
 
 # ============================================================
@@ -173,6 +173,9 @@ podman run --replace --detach --restart=always \
     -v "${DIR}/chat_template.multimodal.jinja":/opt/glm53f/chat_template.multimodal.jinja:ro \
     "${DFLASH_MOUNT[@]}" \
     -e TMPDIR=/container-tmp \
+    -e TRITON_CACHE_DIR=/cache/triton \
+    -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor \
+    -e B12X_COMPILE_CACHE_DIR=/cache/b12x \
     "${VLLM_ENV[@]}" \
     "${IMAGE}" \
         -lc 'unset MAX_NUM_BATCHED_TOKENS MAX_CUDAGRAPH_CAPTURE_SIZE CUDAGRAPH_CAPTURE_SIZES PREFILL_SCHEDULE_INTERVAL FAIRNESS_ENGINE PREFILL_COMPUTE_SHARE VLLM_PCIE_ALLREDUCE_BACKEND VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE
