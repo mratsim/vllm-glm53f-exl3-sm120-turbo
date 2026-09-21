@@ -34,6 +34,10 @@
 #         (FakeTensor compile-only warmups under planning()/offline workers).
 #   0114  uniform route-pack rewarm before capture: clears the prewarm dedup set,
 #         flattens _CompositePlan families, re-runs each child's b12x compile jobs.
+#   0115  lmcache async store: bind the background commit threads to the KV
+#         device. Fresh threads keep the CUDA default device 0, so on rank 1
+#         every store resolved its stream context against the wrong GPU and
+#         failed with CUDA OOM at the stream switch.
 #   0201  [deleted] BTX adoption overlay, superseded by the 0101 vllm-side re-home.
 #   0202  [deleted] w4a16 trellis3 mixed API, present at both b12x revisions.
 #         The build-time check still verifies the symbol.
@@ -54,7 +58,7 @@ FROM ${BASE_IMAGE}
 ARG BASE_IMAGE
 ARG EXLLAMAV3_REPO
 ARG EXLLAMAV3_COMMIT
-ARG VLLM_GLM53F_EXL3_REVISION=r5
+ARG VLLM_GLM53F_EXL3_REVISION=r6
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -62,7 +66,7 @@ LABEL ai.vllm.base.tag="karmic-kraken-beta-20260919-cfc67a15ebc3daf7" \
       ai.vllm.base.pins="vllm=67bb922f6f4(integration/karmic-kraken-beta),b12x=eea3ced11fc1,exllamav3=704aefd743b,cuda=13.4.1,torch=2.14" \
       ai.vllm.exllamav3.repo="${EXLLAMAV3_REPO}" \
       ai.vllm.exllamav3.commit="${EXLLAMAV3_COMMIT}" \
-      ai.vllm.patchset="0101-exl3-adapter,0102-exl3-quant-registration,0103-exl3-config-detection,0104-routed-experts-per-expert-trellis,0105-exl3-b12x13-rate-contract,0106-exl3-adoption-alias-and-guards,0107-exl3-path-audit-logs,0108-rejection-sampler-padding-mask,0111-gpu-worker-route-pack-rewarm,0112-exl3-uniform-plan-execution,0113-b12x-full-rotation-planning-clean,0114-exl3-uniform-route-pack-rewarm,0301-exl3-mixed-rate-gate" \
+      ai.vllm.patchset="0101-exl3-adapter,0102-exl3-quant-registration,0103-exl3-config-detection,0104-routed-experts-per-expert-trellis,0105-exl3-b12x13-rate-contract,0106-exl3-adoption-alias-and-guards,0107-exl3-path-audit-logs,0108-rejection-sampler-padding-mask,0111-gpu-worker-route-pack-rewarm,0112-exl3-uniform-plan-execution,0113-b12x-full-rotation-planning-clean,0114-exl3-uniform-route-pack-rewarm,0115-lmcache-async-device-bind,0301-exl3-mixed-rate-gate" \
       ai.vllm.patchset.deleted="0201-b12x-btx-adoption(re-homed-vllm-side),0202-b12x-trellis3-mixed-api(absorbed-upstream)" \
       ai.vllm.revision="${VLLM_GLM53F_EXL3_REVISION}" \
       ai.vllm.target.checkpoint="brandonmusic/GLM-5.3-Flash-tr3-4bpw,satgeze/GLM-5.3-Flash-EXL3-TR3-3.5bpw" \
@@ -158,8 +162,9 @@ RUN set -eu; \
     done; \
     rm -rf /opt/glm53f-exl3-patches; \
     # The patches carry the literal VLLM_PATCHES_REVISION token. The boot log shows the concrete revision.
+    # The 0115 lmcache patch is stamped by the same sweep.
     V="$SP/vllm"; \
-    grep -rl 'sm120-turbo' "$V" | xargs -r sed -i \
+    grep -rl 'sm120-turbo' "$V" "$SP/lmcache" | xargs -r sed -i \
       -e "s/sm120-turbo VLLM_PATCHES_REVISION/sm120-turbo ${VLLM_GLM53F_EXL3_REVISION}/g" \
       -e "s/sm120-turbo r[0-9][0-9]*/sm120-turbo ${VLLM_GLM53F_EXL3_REVISION}/g"
 
@@ -237,6 +242,11 @@ RUN set -eu; \
     grep -q 'rewarm_uniform_route_packs()' "$V/v1/worker/gpu_worker.py" \
       || { echo "0114 gpu_worker call missing: the rewarm must run after the last" \
            "preparation job and immediately before the guarded capture" >&2; exit 1; }; \
+    grep -q 'kv_device_index' \
+      "$SP/lmcache/v1/multiprocess/transfer_context/async_engine_driven.py" \
+      || { echo "0115 async device bind missing: the lmcache commit threads resolve" \
+           "their device implicitly and every rank 1 store then fails with CUDA" \
+           "OOM at the stream switch" >&2; exit 1; }; \
     grep -q '_REVISION_TAG = "\[mratsim.s sm120-turbo r[0-9][0-9]*\]"' \
       "$V/model_executor/layers/quantization/exl3.py" \
       || { echo "0101 log tag missing or unstamped: every added log line must carry the" \

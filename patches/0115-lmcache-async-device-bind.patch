@@ -1,0 +1,37 @@
+diff --git a/lmcache/v1/multiprocess/transfer_context/async_engine_driven.py b/lmcache/v1/multiprocess/transfer_context/async_engine_driven.py
+index 1f4ef7ef..a93574eb 100644
+--- a/lmcache/v1/multiprocess/transfer_context/async_engine_driven.py
++++ b/lmcache/v1/multiprocess/transfer_context/async_engine_driven.py
+@@ -229,8 +229,16 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
+                 self._pending_stores.add(gather_launched)
+ 
+             full_block_ids = _single_group_block_ids(block_ids)
++            # [mratsim's sm120-turbo VLLM_PATCHES_REVISION] The commit-executor
++            # threads are fresh: their implicit current device is 0 even on
++            # rank 1, so stream/event resolution and lazy context materialization
++            # would target the wrong GPU. Bind the task to the KV
++            # device up front (a no-op on rank 0).
++            kv_device_index = next(iter(kv_caches.values())).device.index
+ 
+             def _prepare_gather_and_commit() -> None:
++                if kv_device_index is not None:
++                    torch.cuda.set_device(kv_device_index)
+                 gather_done: Any | None = None
+                 gather_may_be_inflight = False
+                 ok = False
+@@ -471,7 +479,15 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
+                     return completion
+                 self._pending_stores.add(gather_launched)
+ 
++            # [mratsim's sm120-turbo VLLM_PATCHES_REVISION] Same fresh-thread
++            # device binding as the single-group store above: without it every
++            # rank-1 store resolves its stream context against device 0 and
++            # fails deterministically with CUDA OOM at the stream switch.
++            kv_device_index = next(iter(kv_caches.values())).device.index
++
+             def _prepare_gather_and_commit() -> None:
++                if kv_device_index is not None:
++                    torch.cuda.set_device(kv_device_index)
+                 gather_done: Any | None = None
+                 gather_may_be_inflight = False
+                 ok = False

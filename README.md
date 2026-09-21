@@ -9,7 +9,7 @@ chat requests.
 
 1. Build the image once:
    ```bash
-   podman build -t localhost/vllm-glm53f-exl3-sm120-turbo:r4 .
+   podman build -t localhost/vllm-glm53f-exl3-sm120-turbo:r6 .
    ```
 2. Run one of the serve scripts (see the table below). Each script starts
    the server and waits for it to become healthy.

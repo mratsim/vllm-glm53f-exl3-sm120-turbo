@@ -9,7 +9,7 @@ set -euo pipefail
 # ============================================================
 # Image
 # ============================================================
-IMAGE="localhost/vllm-glm53f-exl3-sm120-turbo:r5"
+IMAGE="localhost/vllm-glm53f-exl3-sm120-turbo:r6"
 PODNAME="vllm"
 VLLM_PORT=8000
 
@@ -40,7 +40,7 @@ MODEL_CONTAINER="${MODEL_ROOT}/${MODEL##*/}"
 # ============================================================
 TP_SIZE=2
 DCP_SIZE=2                     # the GPUs split the saved conversation (~2x KV space)
-GPU_UTIL=0.96                 # weights take about 74 GiB per GPU. MNBT 4096 scratch needs headroom
+GPU_UTIL=0.986                 # weights take about 74 GiB per GPU. Rest is KV cache
 CONTEXT_SIZE=-1                      # auto: the model cap (1,048,576) clamped by the KV pool
 MAX_NUM_SEQS=6
 MAX_NUM_BATCHED_TOKENS=4096    # prompt tokens per step. Wider = faster prefill, bigger scratch
@@ -56,29 +56,28 @@ DFLASH_MODEL="${LOCAL_MODELS}"/GLM-5.3-Flash-DFlash2-MXFP8
                               # Small draft model beside the main model.
                               # Wrong guesses are thrown away, output stays exact
 REASONING_EFFORT=high          # low or high. The template default is max and it talks too much.
-HEALTH_START_PERIOD=600
 
 # No expert parallelism. Only the uncut experts of the 4bpw file support it
 EP_FLAG=()
 
-# Ready-made graph sizes. Spec decoding on: (K+1) x seqs. Off: 4 x seqs
-SPEC_K=${DFLASH_TOKENS}      # the rule above, with speculative decoding on
+# CUDA graph sizes stay on vllm auto-derivation (spec-decode tiers included)
+SPEC_K=${DFLASH_TOKENS}      # DFlash draft tokens per decode step
+# Graph sizes are token-keyed: base [1,2,4] for piecewise plus q_len x each
+# reachable request count, so every decode width has an exact graph
+Q=1
 if (( SPEC_K > 0 ))
 then
-    GRAPH_CAP=$(( MAX_NUM_SEQS * (SPEC_K + 1) ))
-else
-    GRAPH_CAP=$(( MAX_NUM_SEQS * 4 ))
+    Q=$(( SPEC_K + 1 ))
 fi
-(( GRAPH_CAP < 6 )) && GRAPH_CAP=6
-
-# The prepared sizes must cover every batch width the server can reach
-CAPTURE_SIZES=()
-s=1
-while (( s <= GRAPH_CAP ))
+CAPTURE_SIZES=(1 2 4)
+r=1
+while (( r <= MAX_NUM_SEQS ))
 do
-    CAPTURE_SIZES+=("$s")
-    s=$(( s < 4 ? s*2 : s+4 ))
+    CAPTURE_SIZES+=("$(( r * Q ))")
+    r=$(( r + 1 ))
 done
+CAPTURE_SIZES=($(printf '%s\n' "${CAPTURE_SIZES[@]}" | sort -n | uniq))
+GRAPH_CAP=${CAPTURE_SIZES[-1]}
 IFS=,
 SIZES_CSV="${CAPTURE_SIZES[*]}"
 unset IFS
@@ -93,18 +92,22 @@ VLLM_EXTRA=()
 
 # The GPUs cannot talk to each other directly. Direct links are off
 VLLM_ENV+=(
-    -e VLLM_ENGINE_READY_TIMEOUT_S=${HEALTH_START_PERIOD}
+    # Engine and runtime
+    -e VLLM_ENGINE_READY_TIMEOUT_S=300
     -e VLLM_ENGINE_ITERATION_TIMEOUT_S=120
-    -e OMP_NUM_THREADS=4
+    -e OMP_NUM_THREADS=2
     -e HF_HUB_OFFLINE=1
     -e SAFETENSORS_FAST_GPU=1
     -e VLLM_USE_V2_MODEL_RUNNER=1
+    # Topology and collectives
     -e VLLM_ENABLE_PCIE_ALLREDUCE=0
     -e NCCL_P2P_DISABLE=1
-    # EXL3 settings. Also set inside the image
+    # EXL3 settings (also set inside the image)
     -e VLLM_EXL3_PREFILL_BLOCK_M=64
     -e VLLM_EXL3_PREFILL_TRELLIS=1
+    # LM head and MTP draft
     -e VLLM_GLM53_MTP_DRAFT_HEAD=bf16
+    # Allocator
     -e CUBLAS_WORKSPACE_CONFIG=:4096:1
 )
 
@@ -147,7 +150,7 @@ VLLM_EXTRA+=(
   printf '  parallel     tp=%s dcp=%s ep=no (mixed rates: TP2 sharded experts)\n' "${TP_SIZE}" "${DCP_SIZE}"
   printf '  quant        exl3 (TR3 mixed K3/K4 per-expert, routed experts only), kv=%s, block=%s\n' "${KV_CACHE_DTYPE}" "${BLOCK_SIZE}"
   printf '  context      %s tokens, mem-fraction=%s\n' "${CONTEXT_SIZE}" "${GPU_UTIL}"
-  printf '  batching     max-seqs=%s, batched-tokens=%s, graph-cap=%s\n' "${MAX_NUM_SEQS}" "${MAX_NUM_BATCHED_TOKENS}" "${GRAPH_CAP}"
+  printf '  batching     max-seqs=%s, batched-tokens=%s\n' "${MAX_NUM_SEQS}" "${MAX_NUM_BATCHED_TOKENS}"
   printf '  speculation  dflash2 (K=%s)\n' "${SPEC_K}"
   printf '  reasoning    %s\n' "${REASONING_EFFORT}"
 } >&2
@@ -159,7 +162,7 @@ VLLM_EXTRA+=(
 podman run --replace --detach --restart=always \
     --entrypoint /bin/bash \
     --health-cmd="curl -f http://localhost:${VLLM_PORT}/health || exit 1" \
-    --health-start-period="${HEALTH_START_PERIOD}s" \
+    --health-start-period=300s \
     --health-interval=30s \
     --health-on-failure=kill \
     --health-retries=3 \
@@ -192,9 +195,8 @@ exec /opt/venv/bin/vllm serve "$@"' -- \
             --dtype bfloat16 \
             --kv-cache-dtype "${KV_CACHE_DTYPE}" \
             --block-size "${BLOCK_SIZE}" \
-            # TODO: explore --mamba-ssm-cache-dtype bfloat16
-            # to divide the cache fixed cost by 2 (verify via the
-            # rebalance line's max-request cost before adoption)
+            `# TODO: explore --mamba-ssm-cache-dtype bfloat16 to divide the cache fixed cost by 2` \
+            --mamba-ssm-cache-dtype bfloat16 \
             --mamba-cache-mode align \
             `# Parallelism` \
             --tensor-parallel-size "${TP_SIZE}" \
