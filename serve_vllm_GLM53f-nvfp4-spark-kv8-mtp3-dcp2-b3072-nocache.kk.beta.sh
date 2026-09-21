@@ -1,5 +1,5 @@
 #!/bin/bash
-# GLM-5.3-Flash NVFP4 Spark (local-inference-lab). 8-bit KV cache, MTP-3, GPUs split (DCP=2). LMCache on.
+# GLM-5.3-Flash NVFP4 Spark (local-inference-lab). 8-bit KV cache, MTP-3, GPUs split (DCP=2). LMCache off.
 set -euo pipefail
 
 # ============================================================
@@ -48,7 +48,7 @@ REASONING_EFFORT=high
 # owns the L1 RAM tier and vLLM gathers and scatters through the MP connector
 # in its workers. Retention equals the chunk so recurrent checkpoints stay
 # inside one object.
-LMCACHE_ENABLED=1
+LMCACHE_ENABLED=0
 LMCACHE_TRANSFER_MODE=engine_driven
 LMCACHE_L1_GB=64
 LMCACHE_L1_INIT_GB=2
